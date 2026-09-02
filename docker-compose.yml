@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: jobqueue
+      POSTGRES_PASSWORD: jobqueue
+      POSTGRES_DB: jobqueue
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobqueue -d jobqueue"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

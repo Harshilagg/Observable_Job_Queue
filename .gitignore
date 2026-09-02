@@ -1,0 +1,10 @@
+/bin/
+*.test
+*.out
+
+.env
+.envrc
+
+.DS_Store
+.idea/
+.vscode/
