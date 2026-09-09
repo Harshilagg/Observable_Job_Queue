@@ -11,6 +11,7 @@ import (
 // Config holds everything the binary needs to connect to Postgres and run workers.
 type Config struct {
 	DatabaseURL     string
+	GRPCAddr        string
 	PollInterval    time.Duration
 	MaxPollInterval time.Duration
 	LeaseDuration   time.Duration
@@ -24,6 +25,7 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		DatabaseURL:     getEnv("DATABASE_URL", "postgres://jobqueue:jobqueue@localhost:5433/jobqueue"),
+		GRPCAddr:        getEnv("GRPC_ADDR", "localhost:50051"),
 		PollInterval:    500 * time.Millisecond,
 		MaxPollInterval: 5 * time.Second,
 		LeaseDuration:   30 * time.Second,

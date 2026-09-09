@@ -12,3 +12,15 @@ type Job struct {
 	Attempts    int
 	MaxAttempts int
 }
+
+// Snapshot is a point-in-time view of a job's state, for status
+// queries. Deliberately a separate type from Job: a Snapshot is a read
+// of any job in any state, not a row a worker has claimed and is about
+// to execute.
+type Snapshot struct {
+	ID          int64
+	Status      Status
+	Attempts    int
+	MaxAttempts int
+	LastError   string
+}

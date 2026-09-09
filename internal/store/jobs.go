@@ -28,6 +28,29 @@ func (s *Store) Enqueue(ctx context.Context, jobType string, payload json.RawMes
 	return id, nil
 }
 
+// GetStatus returns a point-in-time snapshot of one job's state. If no
+// job with that id exists, the returned error satisfies
+// errors.Is(err, store.ErrNotFound) — callers (e.g. the gRPC layer) use
+// that to distinguish "not found" from other failures.
+func (s *Store) GetStatus(ctx context.Context, id int64) (job.Snapshot, error) {
+	var snap job.Snapshot
+	var status string
+	var lastErr *string
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, status, attempts, max_attempts, last_error
+		FROM jobs
+		WHERE id = $1
+	`, id).Scan(&snap.ID, &status, &snap.Attempts, &snap.MaxAttempts, &lastErr)
+	if err != nil {
+		return job.Snapshot{}, fmt.Errorf("store: get status: %w", err)
+	}
+	snap.Status = job.Status(status)
+	if lastErr != nil {
+		snap.LastError = *lastErr
+	}
+	return snap, nil
+}
+
 // Claim atomically finds up to limit eligible jobs, marks them running
 // under workerID, and returns them. lease determines how long the claim
 // is valid before the reaper is allowed to reclaim it.

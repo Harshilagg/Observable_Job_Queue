@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package jobqueue.v1;
+
+option go_package = "github.com/Harshilagg/Observable_Job_Queue/internal/pb/jobqueuepb;jobqueuepb";
+
+// JobQueue is the client-facing API for submitting jobs and observing
+// their progress. It is a thin layer over the storage layer in
+// internal/store — it never contains claim/execute/retry logic, which
+// stays in internal/worker.
+service JobQueue {
+  // Submit enqueues a new job and returns its id immediately. It does
+  // not wait for the job to run.
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+
+  // GetStatus returns a job's state as of the moment of the call — a
+  // single snapshot, not a subscription.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // WatchStatus streams status updates for one job until it reaches a
+  // terminal state (completed or failed), at which point the server
+  // closes the stream.
+  rpc WatchStatus(WatchStatusRequest) returns (stream StatusUpdate);
+}
+
+message SubmitRequest {
+  string type = 1;
+  bytes payload = 2; // raw JSON, opaque to this service
+}
+
+message SubmitResponse {
+  int64 id = 1;
+}
+
+message GetStatusRequest {
+  int64 id = 1;
+}
+
+message GetStatusResponse {
+  StatusUpdate status = 1;
+}
+
+message WatchStatusRequest {
+  int64 id = 1;
+}
+
+message StatusUpdate {
+  int64 id = 1;
+  string status = 2;
+  int32 attempts = 3;
+  int32 max_attempts = 4;
+  string last_error = 5;
+}

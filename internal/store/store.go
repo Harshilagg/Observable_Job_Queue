@@ -6,8 +6,15 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ErrNotFound is returned by methods that look up a single job by id
+// when no such job exists. Callers outside this package should check
+// against this, not pgx.ErrNoRows directly — that keeps pgx an
+// implementation detail of the storage layer.
+var ErrNotFound = pgx.ErrNoRows
 
 // Store wraps a pgx connection pool. Methods for enqueueing, claiming,
 // and completing jobs are added on top of this in later steps.

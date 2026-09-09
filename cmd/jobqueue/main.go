@@ -1,8 +1,12 @@
-// Command jobqueue is the entrypoint for both enqueueing jobs and
-// running workers. Usage:
+// Command jobqueue is the entrypoint for submitting jobs, querying
+// their status, and running the workers/API that back the queue.
+// Usage:
 //
-//	jobqueue enqueue -type=<type> -payload=<json>
-//	jobqueue work -workers=<n>
+//	jobqueue serve                          # start the gRPC API
+//	jobqueue work -workers=<n>               # start N workers
+//	jobqueue enqueue -type=<t> -payload=<j>  # submit a job (via gRPC)
+//	jobqueue status -id=<id>                 # one status snapshot (via gRPC)
+//	jobqueue watch -id=<id>                  # stream status until terminal (via gRPC)
 package main
 
 import (
@@ -10,24 +14,31 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
 	"golang.org/x/sync/errgroup"
 
 	"github.com/Harshilagg/Observable_Job_Queue/internal/config"
+	"github.com/Harshilagg/Observable_Job_Queue/internal/grpcserver"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/job"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/logging"
+	"github.com/Harshilagg/Observable_Job_Queue/internal/pb/jobqueuepb"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/store"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/worker"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: jobqueue <enqueue|work> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: jobqueue <serve|work|enqueue|status|watch> [flags]")
 		os.Exit(1)
 	}
 
@@ -38,32 +49,38 @@ func main() {
 	}
 	logger := logging.New(os.Getenv("LOG_LEVEL"))
 
-	ctx := context.Background()
-	st, err := store.New(ctx, cfg.DatabaseURL)
-	if err != nil {
-		logger.Error("failed to connect to database", "error", err)
-		os.Exit(1)
-	}
-	defer st.Close()
-
-	if err := st.Ping(ctx); err != nil {
-		logger.Error("database ping failed", "error", err)
-		os.Exit(1)
-	}
-
 	switch os.Args[1] {
+	// enqueue, status, and watch are pure gRPC clients — no direct
+	// database access. They talk to a running `jobqueue serve` process
+	// exactly the way any other client of this API would.
 	case "enqueue":
-		runEnqueue(ctx, st, os.Args[2:])
+		runEnqueue(cfg, os.Args[2:])
+	case "status":
+		runStatus(cfg, os.Args[2:])
+	case "watch":
+		runWatch(cfg, os.Args[2:])
+	// serve and work are the two processes with direct database access.
+	case "serve":
+		runServe(cfg, logger)
 	case "work":
-		runWork(ctx, cfg, st, logger, os.Args[2:])
+		runWork(cfg, logger, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
 		os.Exit(1)
 	}
 }
 
-// runEnqueue inserts a single job from CLI flags and prints its id.
-func runEnqueue(ctx context.Context, st *store.Store, args []string) {
+// dialClient connects to the gRPC API and returns a client plus a
+// closer the caller must run when done.
+func dialClient(addr string) (jobqueuepb.JobQueueClient, func(), error) {
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("dialing %s: %w", addr, err)
+	}
+	return jobqueuepb.NewJobQueueClient(conn), func() { conn.Close() }, nil
+}
+
+func runEnqueue(cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
 	jobType := fs.String("type", "", "job type (required)")
 	payload := fs.String("payload", "{}", "JSON payload")
@@ -78,25 +95,157 @@ func runEnqueue(ctx context.Context, st *store.Store, args []string) {
 		os.Exit(1)
 	}
 
-	id, err := st.Enqueue(ctx, *jobType, json.RawMessage(*payload))
+	client, closeConn, err := dialClient(cfg.GRPCAddr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "enqueue:", err)
+		os.Exit(1)
+	}
+	defer closeConn()
+
+	resp, err := client.Submit(context.Background(), &jobqueuepb.SubmitRequest{
+		Type:    *jobType,
+		Payload: []byte(*payload),
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "enqueue failed:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("enqueued job %d (type=%s)\n", id, *jobType)
+	fmt.Printf("enqueued job %d (type=%s)\n", resp.GetId(), *jobType)
+}
+
+func runStatus(cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	id := fs.Int64("id", 0, "job id (required)")
+	fs.Parse(args)
+
+	if *id == 0 {
+		fmt.Fprintln(os.Stderr, "status: -id is required")
+		os.Exit(1)
+	}
+
+	client, closeConn, err := dialClient(cfg.GRPCAddr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "status:", err)
+		os.Exit(1)
+	}
+	defer closeConn()
+
+	resp, err := client.GetStatus(context.Background(), &jobqueuepb.GetStatusRequest{Id: *id})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "status failed:", err)
+		os.Exit(1)
+	}
+	printStatusUpdate(resp.GetStatus())
+}
+
+func runWatch(cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	id := fs.Int64("id", 0, "job id (required)")
+	fs.Parse(args)
+
+	if *id == 0 {
+		fmt.Fprintln(os.Stderr, "watch: -id is required")
+		os.Exit(1)
+	}
+
+	client, closeConn, err := dialClient(cfg.GRPCAddr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "watch:", err)
+		os.Exit(1)
+	}
+	defer closeConn()
+
+	stream, err := client.WatchStatus(context.Background(), &jobqueuepb.WatchStatusRequest{Id: *id})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "watch failed:", err)
+		os.Exit(1)
+	}
+	for {
+		update, err := stream.Recv()
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "watch stream error:", err)
+			os.Exit(1)
+		}
+		printStatusUpdate(update)
+	}
+}
+
+func printStatusUpdate(u *jobqueuepb.StatusUpdate) {
+	fmt.Printf("job %d: status=%s attempts=%d/%d last_error=%q\n",
+		u.GetId(), u.GetStatus(), u.GetAttempts(), u.GetMaxAttempts(), u.GetLastError())
+}
+
+// runServe starts the gRPC API on cfg.GRPCAddr and blocks until
+// SIGINT/SIGTERM, at which point it stops accepting new RPCs and lets
+// in-flight ones finish before exiting.
+func runServe(cfg config.Config, logger *slog.Logger) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	st, err := store.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to connect to database", "error", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	if err := st.Ping(ctx); err != nil {
+		logger.Error("database ping failed", "error", err)
+		os.Exit(1)
+	}
+
+	lis, err := net.Listen("tcp", cfg.GRPCAddr)
+	if err != nil {
+		logger.Error("failed to listen", "addr", cfg.GRPCAddr, "error", err)
+		os.Exit(1)
+	}
+
+	grpcServer := grpc.NewServer()
+	jobqueuepb.RegisterJobQueueServer(grpcServer, grpcserver.New(st))
+
+	go func() {
+		<-ctx.Done()
+		logger.Info("shutting down gRPC server")
+		grpcServer.GracefulStop()
+	}()
+
+	logger.Info("gRPC server listening", "addr", cfg.GRPCAddr)
+	if err := grpcServer.Serve(lis); err != nil {
+		logger.Error("gRPC server exited with error", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("shutdown complete")
 }
 
 // runWork starts -workers concurrent workers plus a reaper, and blocks
 // until SIGINT/SIGTERM triggers a graceful shutdown.
-func runWork(parentCtx context.Context, cfg config.Config, st *store.Store, logger *slog.Logger, args []string) {
+func runWork(cfg config.Config, logger *slog.Logger, args []string) {
 	fs := flag.NewFlagSet("work", flag.ExitOnError)
 	workerCount := fs.Int("workers", cfg.WorkerCount, "number of concurrent workers")
 	fs.Parse(args)
 
+	if *workerCount <= 0 {
+		fmt.Fprintf(os.Stderr, "work: -workers must be positive, got %d\n", *workerCount)
+		os.Exit(1)
+	}
+
 	// Cancelled the moment SIGINT/SIGTERM arrives — this is the signal
 	// each worker's Run loop watches to stop claiming new work.
-	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	st, err := store.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to connect to database", "error", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	if err := st.Ping(ctx); err != nil {
+		logger.Error("database ping failed", "error", err)
+		os.Exit(1)
+	}
 
 	handler := demoHandler(logger)
 
