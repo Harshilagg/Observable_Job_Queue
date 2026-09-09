@@ -68,9 +68,14 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 		interval = w.pollInterval
-		err = w.execute(context.WithoutCancel(ctx), jobs[0])
+		// Once a job is claimed, finishing it — running the handler AND
+		// recording the outcome — must not be cut short by shutdown
+		// cancellation. Only the next loop iteration's claim/wait should
+		// see ctx cancelled.
+		jobCtx := context.WithoutCancel(ctx)
+		err = w.execute(jobCtx, jobs[0])
 		if err == nil {
-			err = w.store.Complete(ctx, jobs[0].ID)
+			err = w.store.Complete(jobCtx, jobs[0].ID)
 			if err != nil {
 				w.logger.Error("complete failed", "error", err)
 			}
@@ -78,14 +83,14 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 
 		if jobs[0].Attempts >= jobs[0].MaxAttempts {
-			failErr := w.store.Fail(ctx, jobs[0].ID, err.Error())
+			failErr := w.store.Fail(jobCtx, jobs[0].ID, err.Error())
 			if failErr != nil {
 				w.logger.Error("fail failed", "error", failErr)
 			}
 		} else {
 			delay := w.calculateRetryDelay(jobs[0])
 			runAt := time.Now().Add(delay)
-			err = w.store.Retry(ctx, jobs[0].ID, runAt, err.Error())
+			err = w.store.Retry(jobCtx, jobs[0].ID, runAt, err.Error())
 			if err != nil {
 				w.logger.Error("retry failed", "error", err)
 			}

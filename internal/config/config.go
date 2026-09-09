@@ -10,36 +10,46 @@ import (
 
 // Config holds everything the binary needs to connect to Postgres and run workers.
 type Config struct {
-	DatabaseURL   string
-	PollInterval  time.Duration
-	LeaseDuration time.Duration
-	WorkerCount   int
+	DatabaseURL     string
+	PollInterval    time.Duration
+	MaxPollInterval time.Duration
+	LeaseDuration   time.Duration
+	RetryBaseDelay  time.Duration
+	ReapInterval    time.Duration
+	WorkerCount     int
 }
 
 // Load reads configuration from environment variables, applying defaults
 // for anything not set. It fails fast on malformed (not missing) values.
 func Load() (Config, error) {
 	cfg := Config{
-		DatabaseURL:   getEnv("DATABASE_URL", "postgres://jobqueue:jobqueue@localhost:5433/jobqueue"),
-		PollInterval:  500 * time.Millisecond,
-		LeaseDuration: 30 * time.Second,
-		WorkerCount:   4,
+		DatabaseURL:     getEnv("DATABASE_URL", "postgres://jobqueue:jobqueue@localhost:5433/jobqueue"),
+		PollInterval:    500 * time.Millisecond,
+		MaxPollInterval: 5 * time.Second,
+		LeaseDuration:   30 * time.Second,
+		RetryBaseDelay:  2 * time.Second,
+		ReapInterval:    10 * time.Second,
+		WorkerCount:     4,
 	}
 
-	if v, ok := os.LookupEnv("POLL_INTERVAL"); ok {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return Config{}, fmt.Errorf("config: invalid POLL_INTERVAL %q: %w", v, err)
-		}
-		cfg.PollInterval = d
+	durations := []struct {
+		env string
+		dst *time.Duration
+	}{
+		{"POLL_INTERVAL", &cfg.PollInterval},
+		{"MAX_POLL_INTERVAL", &cfg.MaxPollInterval},
+		{"LEASE_DURATION", &cfg.LeaseDuration},
+		{"RETRY_BASE_DELAY", &cfg.RetryBaseDelay},
+		{"REAP_INTERVAL", &cfg.ReapInterval},
 	}
-
-	if v, ok := os.LookupEnv("LEASE_DURATION"); ok {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return Config{}, fmt.Errorf("config: invalid LEASE_DURATION %q: %w", v, err)
+	for _, d := range durations {
+		if v, ok := os.LookupEnv(d.env); ok {
+			parsed, err := time.ParseDuration(v)
+			if err != nil {
+				return Config{}, fmt.Errorf("config: invalid %s %q: %w", d.env, v, err)
+			}
+			*d.dst = parsed
 		}
-		cfg.LeaseDuration = d
 	}
 
 	if v, ok := os.LookupEnv("WORKER_COUNT"); ok {
