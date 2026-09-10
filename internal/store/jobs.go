@@ -18,9 +18,16 @@ import (
 func (s *Store) Enqueue(ctx context.Context, jobType string, payload json.RawMessage) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO jobs (type, payload)
-		VALUES ($1, $2)
-		RETURNING id
+		WITH inserted AS (
+		    INSERT INTO jobs (type, payload)
+		    VALUES ($1, $2)
+		    RETURNING id, type, attempts
+		),
+		event AS (
+		    INSERT INTO job_events (job_id, job_type, event_type, attempts)
+		    SELECT id, type, 'enqueued', attempts FROM inserted
+		)
+		SELECT id FROM inserted
 	`, jobType, payload).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("store: enqueue: %w", err)
@@ -56,20 +63,27 @@ func (s *Store) GetStatus(ctx context.Context, id int64) (job.Snapshot, error) {
 // is valid before the reaper is allowed to reclaim it.
 func (s *Store) Claim(ctx context.Context, workerID string, lease time.Duration, limit int) ([]job.Job, error) {
 	rows, err := s.pool.Query(ctx, `
-		UPDATE jobs
-		SET status = 'running',
-		    claimed_by = $1,
-		    claimed_at = now(),
-		    lease_expires_at = now() + $2::interval,
-		    attempts = attempts + 1
-		WHERE id IN (
-		    SELECT id FROM jobs
-		    WHERE status = 'queued' AND run_after <= now()
-		    ORDER BY priority DESC, run_after
-		    LIMIT $3
-		    FOR UPDATE SKIP LOCKED
+		WITH claimed AS (
+		    UPDATE jobs
+		    SET status = 'running',
+		        claimed_by = $1,
+		        claimed_at = now(),
+		        lease_expires_at = now() + $2::interval,
+		        attempts = attempts + 1
+		    WHERE id IN (
+		        SELECT id FROM jobs
+		        WHERE status = 'queued' AND run_after <= now()
+		        ORDER BY priority DESC, run_after
+		        LIMIT $3
+		        FOR UPDATE SKIP LOCKED
+		    )
+		    RETURNING id, type, payload, attempts, max_attempts
+		),
+		events AS (
+		    INSERT INTO job_events (job_id, job_type, event_type, attempts, worker_id)
+		    SELECT id, type, 'claimed', attempts, $1 FROM claimed
 		)
-		RETURNING id, type, payload, attempts, max_attempts
+		SELECT id, type, payload, attempts, max_attempts FROM claimed
 	`, workerID, lease.String(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: claim: %w", err)
@@ -88,9 +102,14 @@ func (s *Store) Claim(ctx context.Context, workerID string, lease time.Duration,
 // Complete marks a job as successfully finished.
 func (s *Store) Complete(ctx context.Context, id int64) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE jobs
-		SET status = 'completed', completed_at = now()
-		WHERE id = $1
+		WITH completed AS (
+		    UPDATE jobs
+		    SET status = 'completed', completed_at = now()
+		    WHERE id = $1
+		    RETURNING id, type, attempts
+		)
+		INSERT INTO job_events (job_id, job_type, event_type, attempts)
+		SELECT id, type, 'completed', attempts FROM completed
 	`, id)
 	if err != nil {
 		return fmt.Errorf("store: complete: %w", err)
@@ -103,14 +122,19 @@ func (s *Store) Complete(ctx context.Context, id int64) error {
 // necessarily the one that just failed it — pick it up next time.
 func (s *Store) Retry(ctx context.Context, id int64, runAfter time.Time, lastErr string) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE jobs
-		SET status = 'queued',
-		    run_after = $2,
-		    claimed_by = NULL,
-		    claimed_at = NULL,
-		    lease_expires_at = NULL,
-		    last_error = $3
-		WHERE id = $1
+		WITH retried AS (
+		    UPDATE jobs
+		    SET status = 'queued',
+		        run_after = $2,
+		        claimed_by = NULL,
+		        claimed_at = NULL,
+		        lease_expires_at = NULL,
+		        last_error = $3
+		    WHERE id = $1
+		    RETURNING id, type, attempts
+		)
+		INSERT INTO job_events (job_id, job_type, event_type, attempts, error_message)
+		SELECT id, type, 'retried', attempts, $3 FROM retried
 	`, id, runAfter, lastErr)
 	if err != nil {
 		return fmt.Errorf("store: retry: %w", err)
@@ -135,9 +159,13 @@ func (s *Store) Fail(ctx context.Context, id int64, lastErr string) error {
 		        last_error = $2
 		    WHERE id = $1
 		    RETURNING id, type, payload, attempts
+		),
+		dead_letter AS (
+		    INSERT INTO dead_letters (job_id, type, payload, attempts, last_error)
+		    SELECT id, type, payload, attempts, $2 FROM failed
 		)
-		INSERT INTO dead_letters (job_id, type, payload, attempts, last_error)
-		SELECT id, type, payload, attempts, $2 FROM failed
+		INSERT INTO job_events (job_id, job_type, event_type, attempts, error_message)
+		SELECT id, type, 'failed', attempts, $2 FROM failed
 	`, id, lastErr)
 	if err != nil {
 		return fmt.Errorf("store: fail: %w", err)
@@ -170,6 +198,13 @@ func (s *Store) ReapExpiredLeases(ctx context.Context) (reclaimed int64, deadLet
 		    INSERT INTO dead_letters (job_id, type, payload, attempts, last_error)
 		    SELECT id, type, payload, attempts, $1 FROM reaped WHERE status = 'failed'
 		    RETURNING job_id
+		),
+		events AS (
+		    INSERT INTO job_events (job_id, job_type, event_type, attempts, error_message)
+		    SELECT id, type,
+		           CASE WHEN status = 'failed' THEN 'reaped_failed' ELSE 'reaped_retry' END,
+		           attempts, $1
+		    FROM reaped
 		)
 		SELECT
 		    (SELECT count(*) FROM reaped)::bigint,
@@ -198,4 +233,40 @@ func (s *Store) ListDeadLetters(ctx context.Context, limit int) ([]job.DeadLette
 		return nil, fmt.Errorf("store: list dead letters: scanning rows: %w", err)
 	}
 	return letters, nil
+}
+
+// FetchUnshippedEvents returns up to limit rows from the job_events
+// outbox that haven't been shipped to ClickHouse yet, oldest first.
+func (s *Store) FetchUnshippedEvents(ctx context.Context, limit int) ([]job.Event, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, job_id, job_type, event_type, attempts, worker_id, error_message, occurred_at
+		FROM job_events
+		WHERE shipped_at IS NULL
+		ORDER BY id
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: fetch unshipped events: %w", err)
+	}
+	events, err := pgx.CollectRows(rows, pgx.RowToStructByPos[job.Event])
+	if err != nil {
+		return nil, fmt.Errorf("store: fetch unshipped events: scanning rows: %w", err)
+	}
+	return events, nil
+}
+
+// MarkEventsShipped records that the given outbox rows were
+// successfully sent to ClickHouse, so FetchUnshippedEvents doesn't
+// return them again.
+func (s *Store) MarkEventsShipped(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE job_events SET shipped_at = now() WHERE id = ANY($1)
+	`, ids)
+	if err != nil {
+		return fmt.Errorf("store: mark events shipped: %w", err)
+	}
+	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Harshilagg/Observable_Job_Queue/internal/config"
+	"github.com/Harshilagg/Observable_Job_Queue/internal/job"
 )
 
 // newTestStore connects to the Postgres started by docker-compose and
@@ -31,8 +32,13 @@ func newTestStore(t *testing.T) *Store {
 	t.Cleanup(s.Close)
 
 	// dead_letters has a foreign key to jobs, so it must be cleared first.
+	// job_events has no FK (it's an independent outbox, by design), so
+	// its cleanup order relative to the others doesn't matter.
 	if _, err := s.pool.Exec(ctx, "DELETE FROM dead_letters"); err != nil {
 		t.Fatalf("cleaning dead_letters table: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, "DELETE FROM job_events"); err != nil {
+		t.Fatalf("cleaning job_events table: %v", err)
 	}
 	if _, err := s.pool.Exec(ctx, "DELETE FROM jobs"); err != nil {
 		t.Fatalf("cleaning jobs table: %v", err)
@@ -390,5 +396,152 @@ func TestClaimUnderConcurrencyNeverDoublesClaim(t *testing.T) {
 		if count > 1 {
 			t.Errorf("job %d was claimed %d times, want exactly 1", id, count)
 		}
+	}
+}
+
+// eventTypesFor returns the event_type values recorded for a job, in
+// the order they occurred — the outbox's own view of a job's history.
+func eventTypesFor(t *testing.T, ctx context.Context, s *Store, jobID int64) []string {
+	t.Helper()
+	rows, err := s.pool.Query(ctx, "SELECT event_type FROM job_events WHERE job_id = $1 ORDER BY id", jobID)
+	if err != nil {
+		t.Fatalf("querying job_events: %v", err)
+	}
+	defer rows.Close()
+
+	var types []string
+	for rows.Next() {
+		var et string
+		if err := rows.Scan(&et); err != nil {
+			t.Fatalf("scanning event_type: %v", err)
+		}
+		types = append(types, et)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterating job_events: %v", err)
+	}
+	return types
+}
+
+func TestEventsRecordedForFullSuccessLifecycle(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := s.Claim(ctx, "worker-1", 30*time.Second, 1); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := s.Complete(ctx, id); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	got := eventTypesFor(t, ctx, s, id)
+	want := []string{"enqueued", "claimed", "completed"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("event sequence = %v, want %v", got, want)
+	}
+}
+
+func TestEventsRecordedForRetryAndFail(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := s.Claim(ctx, "worker-1", 30*time.Second, 1); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	// A clearly-past run_after, not exactly time.Now() — the Go process
+	// and the Postgres container don't share a clock, so "now" from one
+	// can be a hair after "now" from the other's perspective, and this
+	// job must be unambiguously eligible for the next Claim.
+	if err := s.Retry(ctx, id, time.Now().Add(-1*time.Second), "transient"); err != nil {
+		t.Fatalf("Retry: %v", err)
+	}
+	if _, err := s.Claim(ctx, "worker-2", 30*time.Second, 1); err != nil {
+		t.Fatalf("second Claim: %v", err)
+	}
+	if err := s.Fail(ctx, id, "permanent"); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+
+	got := eventTypesFor(t, ctx, s, id)
+	want := []string{"enqueued", "claimed", "retried", "claimed", "failed"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("event sequence = %v, want %v", got, want)
+	}
+}
+
+func TestEventsDistinguishReapedRetryFromReapedFailed(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	// max_attempts=1 so a single claim already exhausts it, matching
+	// TestReapExpiredLeasesFailsWhenAttemptsExhausted's fixture pattern.
+	var exhaustedID int64
+	err := s.pool.QueryRow(ctx,
+		"INSERT INTO jobs (type, payload, max_attempts) VALUES ('demo_job', '{}', 1) RETURNING id",
+	).Scan(&exhaustedID)
+	if err != nil {
+		t.Fatalf("inserting exhausted-attempts fixture: %v", err)
+	}
+	requeuedID, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := s.Claim(ctx, "worker-1", -1*time.Second, 2); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, _, err := s.ReapExpiredLeases(ctx); err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+
+	if got := eventTypesFor(t, ctx, s, exhaustedID); len(got) == 0 || got[len(got)-1] != "reaped_failed" {
+		t.Errorf("exhausted job's last event = %v, want last element 'reaped_failed'", got)
+	}
+	if got := eventTypesFor(t, ctx, s, requeuedID); len(got) == 0 || got[len(got)-1] != "reaped_retry" {
+		t.Errorf("requeued job's last event = %v, want last element 'reaped_retry'", got)
+	}
+}
+
+func TestFetchAndMarkUnshippedEvents(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	events, err := s.FetchUnshippedEvents(ctx, 10)
+	if err != nil {
+		t.Fatalf("FetchUnshippedEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d unshipped events, want 1", len(events))
+	}
+	if events[0].JobID != id {
+		t.Errorf("event JobID = %d, want %d", events[0].JobID, id)
+	}
+	if events[0].EventType != job.EventEnqueued {
+		t.Errorf("event EventType = %q, want %q", events[0].EventType, job.EventEnqueued)
+	}
+
+	if err := s.MarkEventsShipped(ctx, []int64{events[0].ID}); err != nil {
+		t.Fatalf("MarkEventsShipped: %v", err)
+	}
+
+	again, err := s.FetchUnshippedEvents(ctx, 10)
+	if err != nil {
+		t.Fatalf("FetchUnshippedEvents after marking shipped: %v", err)
+	}
+	if len(again) != 0 {
+		t.Errorf("got %d unshipped events after marking shipped, want 0", len(again))
 	}
 }
