@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,13 +17,48 @@ import (
 // tests need that container running (docker compose up -d).
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
+	return newTestStoreWithPoolSize(t, 0)
+}
+
+// newTestStoreWithPoolSize is newTestStore, but with the underlying
+// pgxpool sized to guarantee at least minConns connections (0 keeps
+// pgxpool's default, max(4, runtime.NumCPU())).
+//
+// Why this exists: pgxpool's default is tuned for typical production
+// concurrency, not for a test that deliberately hammers the store with
+// far more concurrent callers than the machine has CPUs. On a
+// CPU-constrained machine (this project was debugged on one reporting
+// runtime.NumCPU()==4), a pool that small combined with goroutines
+// that retry immediately on a successful claim (no delay) can starve
+// slower goroutines indefinitely: by the time a starved goroutine
+// finally wins a connection, whatever row it was about to claim has
+// already been taken by whichever goroutine currently dominates the
+// pool. Enough consecutive "someone beat me to it" results trips the
+// give-up threshold, and it exits even though most of the queue is
+// still unclaimed -- reproduced and confirmed by this exact fix:
+// widening the pool alone took a test that failed most runs (claiming
+// as few as 4 of 2000 jobs) to passing consistently, no other change.
+// This is the same "size the pool to your actual concurrent demand"
+// lesson as sizing a real worker fleet's pool, just triggered here by
+// the test's own artificial concurrency instead of production traffic.
+func newTestStoreWithPoolSize(t *testing.T, minConns int) *Store {
+	t.Helper()
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
 
+	dsn := cfg.DatabaseURL
+	if minConns > 0 {
+		sep := "?"
+		if strings.Contains(dsn, "?") {
+			sep = "&"
+		}
+		dsn = fmt.Sprintf("%s%spool_max_conns=%d", dsn, sep, minConns)
+	}
+
 	ctx := context.Background()
-	s, err := New(ctx, cfg.DatabaseURL)
+	s, err := New(ctx, dsn)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
@@ -346,10 +382,15 @@ func TestListDeadLettersReturnsMostRecentFirst(t *testing.T) {
 // queue, every job is claimed exactly once — not zero times, not twice.
 func TestClaimUnderConcurrencyNeverDoublesClaim(t *testing.T) {
 	ctx := context.Background()
-	s := newTestStore(t)
 
 	const totalJobs = 2000
 	const workerCount = 20
+
+	// See newTestStoreWithPoolSize's doc comment: this test's 20-way
+	// concurrency needs a pool that can actually serve 20 simultaneous
+	// callers, or the default (sized for CPU count, not for this test's
+	// artificial concurrency) can starve some of them.
+	s := newTestStoreWithPoolSize(t, workerCount)
 
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO jobs (type, payload)
