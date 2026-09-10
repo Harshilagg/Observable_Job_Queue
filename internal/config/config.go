@@ -28,6 +28,9 @@ type Config struct {
 	ClickHousePassword string
 	ShipInterval       time.Duration
 	ShipBatchSize      int
+
+	OTLPEndpoint string
+	MetricsAddr  string
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -52,6 +55,9 @@ func Load() (Config, error) {
 		ClickHousePassword: getEnv("CLICKHOUSE_PASSWORD", "jobqueue"),
 		ShipInterval:       5 * time.Second,
 		ShipBatchSize:      1000,
+
+		OTLPEndpoint: getEnv("OTLP_ENDPOINT", "localhost:4317"),
+		MetricsAddr:  getEnv("METRICS_ADDR", ":9464"),
 	}
 
 	durations := []struct {

@@ -34,6 +34,57 @@ services:
       timeout: 3s
       retries: 20
 
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    restart: unless-stopped
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9091:9090" # UI/API — 9091 on the host since 9090 is a common local default elsewhere
+    # jobqueue's work process runs on the host, not in a container (same
+    # split as Postgres/ClickHouse-in-Docker, app-on-host throughout this
+    # project) — host.docker.internal is Docker Desktop's built-in way for
+    # a container to reach the host; host-gateway makes the same name work
+    # on Linux Docker Engine too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  tempo:
+    image: grafana/tempo:3.0.3
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempodata:/var/tempo
+    ports:
+      - "4317:4317" # OTLP gRPC — what the Go app exports traces to
+      - "4318:4318" # OTLP HTTP
+      - "3200:3200" # Tempo's own query API, used by Grafana's datasource
+
+  grafana:
+    image: grafana/grafana:13.2.1
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - tempo
+    environment:
+      # Anonymous viewer access so `docker compose up` alone gives a
+      # working, viewable dashboard at localhost:3000 with no login step.
+      # Editing still requires the admin login below.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
 volumes:
   pgdata:
   chdata:
+  promdata:
+  tempodata:
+  grafanadata:

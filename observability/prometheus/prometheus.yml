@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: jobqueue
+    static_configs:
+      # jobqueue's `work` process runs on the host, not in a container
+      # (same as this whole project's Postgres/ClickHouse-in-Docker,
+      # app-on-host split) -- host.docker.internal is how a container
+      # reaches back out to the host. See docker-compose.yml's
+      # extra_hosts entry for the Linux compatibility note.
+      - targets: ["host.docker.internal:9464"]
