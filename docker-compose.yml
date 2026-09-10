@@ -16,5 +16,24 @@ services:
       timeout: 3s
       retries: 10
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8.2
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: jobqueue
+      CLICKHOUSE_USER: jobqueue
+      CLICKHOUSE_PASSWORD: jobqueue
+    ports:
+      - "9001:9000" # native protocol — what the Go client uses
+      - "8124:8123" # HTTP — used only for the healthcheck below
+    volumes:
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
 volumes:
   pgdata:
+  chdata:
