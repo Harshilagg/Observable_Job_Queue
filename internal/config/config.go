@@ -20,6 +20,13 @@ type Config struct {
 	MaxRetryDelay   time.Duration
 	ReapInterval    time.Duration
 	WorkerCount     int
+
+	ClickHouseAddr     string
+	ClickHouseDatabase string
+	ClickHouseUser     string
+	ClickHousePassword string
+	ShipInterval       time.Duration
+	ShipBatchSize      int
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -36,6 +43,13 @@ func Load() (Config, error) {
 		MaxRetryDelay:   5 * time.Minute,
 		ReapInterval:    10 * time.Second,
 		WorkerCount:     4,
+
+		ClickHouseAddr:     getEnv("CLICKHOUSE_ADDR", "localhost:9001"),
+		ClickHouseDatabase: getEnv("CLICKHOUSE_DATABASE", "jobqueue"),
+		ClickHouseUser:     getEnv("CLICKHOUSE_USER", "jobqueue"),
+		ClickHousePassword: getEnv("CLICKHOUSE_PASSWORD", "jobqueue"),
+		ShipInterval:       5 * time.Second,
+		ShipBatchSize:      1000,
 	}
 
 	durations := []struct {
@@ -48,6 +62,7 @@ func Load() (Config, error) {
 		{"RETRY_BASE_DELAY", &cfg.RetryBaseDelay},
 		{"MAX_RETRY_DELAY", &cfg.MaxRetryDelay},
 		{"REAP_INTERVAL", &cfg.ReapInterval},
+		{"SHIP_INTERVAL", &cfg.ShipInterval},
 	}
 	for _, d := range durations {
 		if v, ok := os.LookupEnv(d.env); ok {
@@ -65,6 +80,14 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("config: invalid WORKER_COUNT %q: %w", v, err)
 		}
 		cfg.WorkerCount = n
+	}
+
+	if v, ok := os.LookupEnv("SHIP_BATCH_SIZE"); ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: invalid SHIP_BATCH_SIZE %q: %w", v, err)
+		}
+		cfg.ShipBatchSize = n
 	}
 
 	return cfg, nil

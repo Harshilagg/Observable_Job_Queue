@@ -28,6 +28,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Harshilagg/Observable_Job_Queue/internal/analytics"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/config"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/grpcserver"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/handlers"
@@ -297,6 +298,22 @@ func runWork(cfg config.Config, logger *slog.Logger, args []string) {
 		runReaper(gctx, st, cfg.ReapInterval, logger)
 		return nil
 	})
+
+	// ClickHouse being unreachable at startup must not stop job
+	// processing — that would defeat the entire point of shipping
+	// events through an outbox instead of writing them synchronously.
+	// If this fails, events simply accumulate unshipped in Postgres
+	// until a future `work` process finds ClickHouse reachable.
+	chClient, err := analytics.NewClient(ctx, cfg.ClickHouseAddr, cfg.ClickHouseDatabase, cfg.ClickHouseUser, cfg.ClickHousePassword)
+	if err != nil {
+		logger.Error("clickhouse unreachable, running without event shipping", "error", err)
+	} else {
+		defer chClient.Close()
+		g.Go(func() error {
+			analytics.RunShipper(gctx, st, chClient, cfg.ShipInterval, cfg.ShipBatchSize, logger)
+			return nil
+		})
+	}
 
 	logger.Info("workers started", "count", *workerCount)
 	if err := g.Wait(); err != nil {

@@ -39,10 +39,15 @@ proto:
 build:
 	go build -o bin/$(BINARY) $(CMD)
 
-# Needs Postgres running with the schema applied (docker compose up -d
-# && make migrate) — these hit the real database, not a mock.
+# Needs Postgres and ClickHouse running with schemas applied
+# (docker compose up -d, make migrate, make ch-migrate) — these hit
+# real databases, not mocks. -p 1 forces packages to run one at a
+# time: internal/store and internal/analytics both mutate the same
+# live, shared Postgres tables, and Go runs different packages'
+# tests concurrently by default, which caused exactly the kind of
+# flaky cross-package interference this is here to prevent.
 test:
-	go test ./...
+	go test -p 1 -count=1 ./...
 
 run: build
 	./bin/$(BINARY) $(ARGS)

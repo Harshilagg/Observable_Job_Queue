@@ -362,11 +362,22 @@ func TestClaimUnderConcurrencyNeverDoublesClaim(t *testing.T) {
 	var mu sync.Mutex
 	var claimed []int64
 
+	// A single empty Claim result isn't reliable proof the queue is
+	// exhausted — under real contention (many concurrent claimers, each
+	// holding a row lock for the duration of its own statement), a
+	// worker can transiently see nothing available even while rows
+	// remain, the same reason production Worker.Run backs off and
+	// retries rather than giving up on the first empty result. Mirror
+	// that here: only conclude "done" after several consecutive empty
+	// results, not the first one.
+	const maxConsecutiveEmpty = 10
+
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func(workerID string) {
 			defer wg.Done()
+			consecutiveEmpty := 0
 			for {
 				jobs, err := s.Claim(ctx, workerID, 30*time.Second, 1)
 				if err != nil {
@@ -374,8 +385,14 @@ func TestClaimUnderConcurrencyNeverDoublesClaim(t *testing.T) {
 					return
 				}
 				if len(jobs) == 0 {
-					return
+					consecutiveEmpty++
+					if consecutiveEmpty >= maxConsecutiveEmpty {
+						return
+					}
+					time.Sleep(20 * time.Millisecond)
+					continue
 				}
+				consecutiveEmpty = 0
 				mu.Lock()
 				claimed = append(claimed, jobs[0].ID)
 				mu.Unlock()
