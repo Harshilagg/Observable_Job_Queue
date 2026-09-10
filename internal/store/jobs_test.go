@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -48,17 +47,8 @@ func newTestStoreWithPoolSize(t *testing.T, minConns int) *Store {
 		t.Fatalf("config.Load: %v", err)
 	}
 
-	dsn := cfg.DatabaseURL
-	if minConns > 0 {
-		sep := "?"
-		if strings.Contains(dsn, "?") {
-			sep = "&"
-		}
-		dsn = fmt.Sprintf("%s%spool_max_conns=%d", dsn, sep, minConns)
-	}
-
 	ctx := context.Background()
-	s, err := New(ctx, dsn)
+	s, err := New(ctx, cfg.DatabaseURL, int32(minConns))
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}

@@ -11,6 +11,7 @@ import (
 // Config holds everything the binary needs to connect to Postgres and run workers.
 type Config struct {
 	DatabaseURL     string
+	DBMaxConns      int32
 	GRPCAddr        string
 	WriteFileDir    string
 	PollInterval    time.Duration
@@ -34,6 +35,7 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		DatabaseURL:     getEnv("DATABASE_URL", "postgres://jobqueue:jobqueue@localhost:5433/jobqueue"),
+		DBMaxConns:      20,
 		GRPCAddr:        getEnv("GRPC_ADDR", "localhost:50051"),
 		WriteFileDir:    getEnv("WRITE_FILE_DIR", "./data/writes"),
 		PollInterval:    500 * time.Millisecond,
@@ -72,6 +74,14 @@ func Load() (Config, error) {
 			}
 			*d.dst = parsed
 		}
+	}
+
+	if v, ok := os.LookupEnv("DB_MAX_CONNS"); ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: invalid DB_MAX_CONNS %q: %w", v, err)
+		}
+		cfg.DBMaxConns = int32(n)
 	}
 
 	if v, ok := os.LookupEnv("WORKER_COUNT"); ok {

@@ -23,11 +23,28 @@ type Store struct {
 }
 
 // New connects to Postgres using connString and returns a Store backed
-// by a connection pool. It does not verify connectivity beyond what
-// pgxpool.New itself checks; call Ping to confirm the database is
-// actually reachable.
-func New(ctx context.Context, connString string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, connString)
+// by a connection pool sized to maxConns (0 keeps pgxpool's own
+// default, max(4, runtime.NumCPU())). It does not verify connectivity
+// beyond what pgxpool itself checks; call Ping to confirm the database
+// is actually reachable.
+//
+// Explicit sizing matters here for a concrete, previously-hit reason:
+// pgxpool's CPU-based default has no idea how many concurrent workers,
+// plus a reaper, plus a shipper, will actually be sharing this one
+// pool — on a machine with few CPUs, that default can be smaller than
+// the real concurrent demand, and callers waiting on a saturated pool
+// isn't a hypothetical, it was reproduced and fixed in this project's
+// own test suite (see newTestStoreWithPoolSize in internal/store).
+func New(ctx context.Context, connString string, maxConns int32) (*Store, error) {
+	cfg, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, fmt.Errorf("store: parsing connection string: %w", err)
+	}
+	if maxConns > 0 {
+		cfg.MaxConns = maxConns
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("store: creating pool: %w", err)
 	}

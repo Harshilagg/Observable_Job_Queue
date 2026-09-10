@@ -191,7 +191,7 @@ func runDeadLetters(cfg config.Config, args []string) {
 	fs.Parse(args)
 
 	ctx := context.Background()
-	st, err := store.New(ctx, cfg.DatabaseURL)
+	st, err := store.New(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "dead-letters:", err)
 		os.Exit(1)
@@ -220,7 +220,7 @@ func runServe(cfg config.Config, logger *slog.Logger) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.New(ctx, cfg.DatabaseURL)
+	st, err := store.New(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
 		logger.Error("failed to connect to database", "error", err)
 		os.Exit(1)
@@ -271,7 +271,15 @@ func runWork(cfg config.Config, logger *slog.Logger, args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.New(ctx, cfg.DatabaseURL)
+	// Sized to this process's own actual concurrent demand — one
+	// connection per worker, plus headroom for the reaper and shipper
+	// goroutines that share this same pool — rather than trusting
+	// pgxpool's CPU-based default, which has no idea how many workers
+	// were requested and was the root cause of a real, reproduced
+	// starvation bug in this project's own test suite (see
+	// newTestStoreWithPoolSize in internal/store).
+	dbMaxConns := int32(*workerCount) + 4
+	st, err := store.New(ctx, cfg.DatabaseURL, dbMaxConns)
 	if err != nil {
 		logger.Error("failed to connect to database", "error", err)
 		os.Exit(1)

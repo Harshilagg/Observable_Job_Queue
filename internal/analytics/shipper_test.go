@@ -45,7 +45,7 @@ func testEnv(t *testing.T) (*store.Store, *Client, config.Config) {
 		t.Fatalf("cleaning jobs: %v", err)
 	}
 
-	st, err := store.New(ctx, cfg.DatabaseURL)
+	st, err := store.New(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
