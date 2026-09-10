@@ -12,6 +12,7 @@ import (
 type Config struct {
 	DatabaseURL     string
 	GRPCAddr        string
+	WriteFileDir    string
 	PollInterval    time.Duration
 	MaxPollInterval time.Duration
 	LeaseDuration   time.Duration
@@ -26,6 +27,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		DatabaseURL:     getEnv("DATABASE_URL", "postgres://jobqueue:jobqueue@localhost:5433/jobqueue"),
 		GRPCAddr:        getEnv("GRPC_ADDR", "localhost:50051"),
+		WriteFileDir:    getEnv("WRITE_FILE_DIR", "./data/writes"),
 		PollInterval:    500 * time.Millisecond,
 		MaxPollInterval: 5 * time.Second,
 		LeaseDuration:   30 * time.Second,

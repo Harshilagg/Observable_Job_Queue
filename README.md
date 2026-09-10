@@ -39,9 +39,9 @@ Two long-running processes, plus a CLI that talks to them:
 ```
 
 ```
-./bin/jobqueue enqueue -type=demo_job -payload='{"n":1}'   # via gRPC Submit
-./bin/jobqueue status -id=123                              # via gRPC GetStatus
-./bin/jobqueue watch -id=123                                # via gRPC WatchStatus (streams until terminal)
+./bin/jobqueue enqueue -type=sum_numbers -payload='{"numbers":[1,2,3]}'   # via gRPC Submit
+./bin/jobqueue status -id=123                                             # via gRPC GetStatus
+./bin/jobqueue watch -id=123                                              # via gRPC WatchStatus (streams until terminal)
 ```
 
 `serve` and `work` are independent processes with direct database
@@ -52,6 +52,27 @@ but let anything already in progress finish before exiting. A
 background reaper (inside `work`) reclaims jobs left `running` past
 their lease — the recovery path when a worker is killed mid-job.
 
+### Job types
+
+`work` dispatches a claimed job to a handler by its `type`, via the
+registry in `internal/handlers`:
+
+| Type          | Payload                                    | Notes |
+|---------------|---------------------------------------------|-------|
+| `http_check`  | `{"url": "...", "timeout_seconds": 5}`       | Real outbound HTTP GET; non-2xx or a network error fails the job |
+| `write_file`  | `{"name": "...", "content": "..."}`          | Writes under `WRITE_FILE_DIR`; naturally idempotent (rewriting the same content is safe under at-least-once retries) |
+| `sum_numbers` | `{"numbers": [1, 2, 3]}`                     | Pure computation, no side effects |
+
+A job whose `type` isn't registered is **not** failed immediately — it
+goes through the same retry-with-backoff path as any other failure,
+and only reaches the terminal `failed` state after exhausting
+`max_attempts`. This is deliberate: in a rolling deploy, an older
+worker might momentarily not have a type registered that a newer one
+does, and failing outright would permanently lose a job a worker
+seconds away from existing could have handled. See the comment on
+`Registry.Dispatch` in `internal/handlers/registry.go` for the full
+reasoning.
+
 ## Configuration
 
 All via environment variables; every one has a default suitable for the
@@ -61,6 +82,7 @@ All via environment variables; every one has a default suitable for the
 |---------------------|-------------------------------------------------------------|---------------------------------------------------|
 | `DATABASE_URL`       | `postgres://jobqueue:jobqueue@localhost:5433/jobqueue`       | Postgres connection string (used by `serve`, `work`) |
 | `GRPC_ADDR`          | `localhost:50051`                                             | Address `serve` listens on, and clients dial      |
+| `WRITE_FILE_DIR`     | `./data/writes`                                               | Sandbox directory the `write_file` handler is allowed to write into |
 | `WORKER_COUNT`       | `4`                                                           | Default `-workers` for `work` if not overridden   |
 | `POLL_INTERVAL`      | `500ms`                                                       | How often an idle worker checks for new jobs      |
 | `MAX_POLL_INTERVAL`  | `5s`                                                          | Cap on the poll backoff when the queue stays empty|
@@ -88,6 +110,7 @@ internal/pb/jobqueuepb/       generated from proto/ — do not hand-edit
 internal/grpcserver/          gRPC service implementation (thin: proto <-> store)
 internal/store/               all SQL; Claim/Complete/Retry/Fail/ReapExpiredLeases
 internal/worker/              claim/execute/complete loop
+internal/handlers/            job-type registry + real handler implementations
 internal/job/                 domain types shared across the above
 cmd/jobqueue/                 serve / work / enqueue / status / watch
 ```

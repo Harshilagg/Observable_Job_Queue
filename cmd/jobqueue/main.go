@@ -29,7 +29,7 @@ import (
 
 	"github.com/Harshilagg/Observable_Job_Queue/internal/config"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/grpcserver"
-	"github.com/Harshilagg/Observable_Job_Queue/internal/job"
+	"github.com/Harshilagg/Observable_Job_Queue/internal/handlers"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/logging"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/pb/jobqueuepb"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/store"
@@ -247,13 +247,13 @@ func runWork(cfg config.Config, logger *slog.Logger, args []string) {
 		os.Exit(1)
 	}
 
-	handler := demoHandler(logger)
+	registry := newHandlerRegistry(cfg, logger)
 
 	g, gctx := errgroup.WithContext(ctx)
 
 	for i := 0; i < *workerCount; i++ {
 		id := fmt.Sprintf("worker-%d", i)
-		w := worker.New(st, handler, id, cfg.LeaseDuration, cfg.PollInterval, cfg.MaxPollInterval, cfg.RetryBaseDelay, logger)
+		w := worker.New(st, registry.Dispatch, id, cfg.LeaseDuration, cfg.PollInterval, cfg.MaxPollInterval, cfg.RetryBaseDelay, logger)
 		g.Go(func() error {
 			return w.Run(gctx)
 		})
@@ -295,13 +295,12 @@ func runReaper(ctx context.Context, st *store.Store, interval time.Duration, log
 	}
 }
 
-// demoHandler is a placeholder job handler for this stage: it logs the
-// job and simulates a small amount of work. Real handlers (dispatched
-// by job.Type) are outside this session's scope.
-func demoHandler(logger *slog.Logger) worker.Handler {
-	return func(ctx context.Context, j job.Job) error {
-		logger.Info("processing job", "id", j.ID, "type", j.Type, "payload", string(j.Payload))
-		time.Sleep(200 * time.Millisecond)
-		return nil
-	}
+// newHandlerRegistry builds and populates the job-type -> Handler
+// registry. Add a new job type by registering it here.
+func newHandlerRegistry(cfg config.Config, logger *slog.Logger) handlers.Registry {
+	r := handlers.NewRegistry()
+	r.Register("http_check", handlers.HTTPCheck)
+	r.Register("write_file", handlers.NewWriteFileHandler(cfg.WriteFileDir))
+	r.Register("sum_numbers", handlers.NewSumNumbersHandler(logger))
+	return r
 }

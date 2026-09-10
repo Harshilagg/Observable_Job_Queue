@@ -1,4 +1,5 @@
 /bin/
+/data/
 *.test
 *.out
 
