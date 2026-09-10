@@ -76,7 +76,7 @@ func TestEnqueueClaimComplete(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	id, err := s.Enqueue(ctx, "demo_job", []byte(`{"n":1}`))
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{"n":1}`), "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestRetryReturnsJobToQueueWithBackoff(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`), "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestFailIsTerminal(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`), "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestReapExpiredLeasesRequeuesUnderAttemptCeiling(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`), "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestListDeadLettersReturnsMostRecentFirst(t *testing.T) {
 
 	var ids []int64
 	for i := 0; i < 3; i++ {
-		id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+		id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`), "")
 		if err != nil {
 			t.Fatalf("Enqueue: %v", err)
 		}
@@ -401,7 +401,22 @@ func TestClaimUnderConcurrencyNeverDoublesClaim(t *testing.T) {
 	// retries rather than giving up on the first empty result. Mirror
 	// that here: only conclude "done" after several consecutive empty
 	// results, not the first one.
-	const maxConsecutiveEmpty = 10
+	//
+	// maxConsecutiveEmpty is intentionally generous (200, not 10): this
+	// project's dev machine has gone from running 2 Docker containers
+	// to a dozen over the course of the project (Postgres, ClickHouse,
+	// now Prometheus/Tempo/Grafana, plus unrelated ones sharing the
+	// same host), and individual query latency under that contention
+	// has been directly measured taking seconds, not milliseconds, on
+	// a machine reporting runtime.NumCPU()==4. A tighter threshold here
+	// doesn't catch more bugs, it just makes the test flaky on exactly
+	// the kind of shared, heavily loaded machine this project has
+	// actually been built on -- the same distinction as the earlier
+	// pool-sizing investigation: verify the mechanism is correct (it
+	// is; see TestClaimUnderConcurrencyNeverDoublesClaim's own
+	// assertions below), and give slow-but-correct enough patience to
+	// actually observe that.
+	const maxConsecutiveEmpty = 200
 
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
@@ -420,7 +435,7 @@ func TestClaimUnderConcurrencyNeverDoublesClaim(t *testing.T) {
 					if consecutiveEmpty >= maxConsecutiveEmpty {
 						return
 					}
-					time.Sleep(20 * time.Millisecond)
+					time.Sleep(50 * time.Millisecond)
 					continue
 				}
 				consecutiveEmpty = 0
@@ -475,7 +490,7 @@ func TestEventsRecordedForFullSuccessLifecycle(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`), "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -497,7 +512,7 @@ func TestEventsRecordedForRetryAndFail(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`), "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -538,7 +553,7 @@ func TestEventsDistinguishReapedRetryFromReapedFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inserting exhausted-attempts fixture: %v", err)
 	}
-	requeuedID, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	requeuedID, err := s.Enqueue(ctx, "demo_job", []byte(`{}`), "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -562,7 +577,7 @@ func TestFetchAndMarkUnshippedEvents(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+	id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`), "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -591,5 +606,95 @@ func TestFetchAndMarkUnshippedEvents(t *testing.T) {
 	}
 	if len(again) != 0 {
 		t.Errorf("got %d unshipped events after marking shipped, want 0", len(again))
+	}
+}
+
+// TestCountByStatusAndType backs the queue-depth/in-flight metrics
+// collector — it asserts the grouping is by type and only counts the
+// requested status, not just that it doesn't error.
+func TestCountByStatusAndType(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	if _, err := s.Enqueue(ctx, "http_check", []byte(`{}`), ""); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := s.Enqueue(ctx, "http_check", []byte(`{}`), ""); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := s.Enqueue(ctx, "sum_numbers", []byte(`{}`), ""); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	queued, err := s.CountByStatusAndType(ctx, string(job.StatusQueued))
+	if err != nil {
+		t.Fatalf("CountByStatusAndType(queued): %v", err)
+	}
+	if queued["http_check"] != 2 {
+		t.Errorf("queued[http_check] = %d, want 2", queued["http_check"])
+	}
+	if queued["sum_numbers"] != 1 {
+		t.Errorf("queued[sum_numbers] = %d, want 1", queued["sum_numbers"])
+	}
+
+	// Claim doesn't filter by type — it claims whichever eligible jobs
+	// sort first regardless of type — so claim all three at once rather
+	// than assuming which one a limit-1 claim would happen to pick.
+	// What must hold afterward: none show up as queued anymore, and
+	// each shows up under running with its original type.
+	claimed, err := s.Claim(ctx, "worker-1", 30*time.Second, 3)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(claimed) != 3 {
+		t.Fatalf("Claim returned %d jobs, want 3", len(claimed))
+	}
+
+	queuedAfter, err := s.CountByStatusAndType(ctx, string(job.StatusQueued))
+	if err != nil {
+		t.Fatalf("CountByStatusAndType(queued) after claim: %v", err)
+	}
+	if len(queuedAfter) != 0 {
+		t.Errorf("CountByStatusAndType(queued) after claiming everything = %v, want empty", queuedAfter)
+	}
+
+	running, err := s.CountByStatusAndType(ctx, string(job.StatusRunning))
+	if err != nil {
+		t.Fatalf("CountByStatusAndType(running): %v", err)
+	}
+	if running["http_check"] != 2 {
+		t.Errorf("running[http_check] = %d, want 2", running["http_check"])
+	}
+	if running["sum_numbers"] != 1 {
+		t.Errorf("running[sum_numbers] = %d, want 1", running["sum_numbers"])
+	}
+}
+
+// TestShipperLag asserts both ends: 0 with nothing unshipped, and a
+// positive, growing duration once an event is left unshipped.
+func TestShipperLag(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	lag, err := s.ShipperLag(ctx)
+	if err != nil {
+		t.Fatalf("ShipperLag with nothing unshipped: %v", err)
+	}
+	if lag != 0 {
+		t.Errorf("ShipperLag with nothing unshipped = %v, want 0", lag)
+	}
+
+	if _, err := s.Enqueue(ctx, "sum_numbers", []byte(`{}`), ""); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	lag, err = s.ShipperLag(ctx)
+	if err != nil {
+		t.Fatalf("ShipperLag with one unshipped event: %v", err)
+	}
+	if lag <= 0 {
+		t.Errorf("ShipperLag with one unshipped event = %v, want > 0", lag)
 	}
 }

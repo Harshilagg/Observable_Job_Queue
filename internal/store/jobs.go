@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,12 +16,12 @@ import (
 // returns its id. Status, priority, and max_attempts take the schema's
 // defaults ('queued', 0, 5) — this is deliberately minimal; callers
 // needing to override them can be added when something actually needs it.
-func (s *Store) Enqueue(ctx context.Context, jobType string, payload json.RawMessage) (int64, error) {
+func (s *Store) Enqueue(ctx context.Context, jobType string, payload json.RawMessage, traceContext string) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx, `
 		WITH inserted AS (
-		    INSERT INTO jobs (type, payload)
-		    VALUES ($1, $2)
+		    INSERT INTO jobs (type, payload, trace_context)
+		    VALUES ($1, $2, $3)
 		    RETURNING id, type, attempts
 		),
 		event AS (
@@ -28,7 +29,7 @@ func (s *Store) Enqueue(ctx context.Context, jobType string, payload json.RawMes
 		    SELECT id, type, 'enqueued', attempts FROM inserted
 		)
 		SELECT id FROM inserted
-	`, jobType, payload).Scan(&id)
+	`, jobType, payload, traceContext).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("store: enqueue: %w", err)
 	}
@@ -77,21 +78,22 @@ func (s *Store) Claim(ctx context.Context, workerID string, lease time.Duration,
 		        LIMIT $3
 		        FOR UPDATE SKIP LOCKED
 		    )
-		    RETURNING id, type, payload, attempts, max_attempts
+		    RETURNING id, type, payload, attempts, max_attempts, trace_context
 		),
 		events AS (
 		    INSERT INTO job_events (job_id, job_type, event_type, attempts, worker_id)
 		    SELECT id, type, 'claimed', attempts, $1 FROM claimed
 		)
-		SELECT id, type, payload, attempts, max_attempts FROM claimed
+		SELECT id, type, payload, attempts, max_attempts, trace_context FROM claimed
 	`, workerID, lease.String(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: claim: %w", err)
 	}
 
 	// RowToStructByPos matches columns to job.Job's fields by position, in
-	// declaration order (ID, Type, Payload, Attempts, MaxAttempts) — which
-	// is why the RETURNING list above is written in that exact order.
+	// declaration order (ID, Type, Payload, Attempts, MaxAttempts,
+	// TraceContext) — which is why the RETURNING list above is written
+	// in that exact order.
 	jobs, err := pgx.CollectRows(rows, pgx.RowToStructByPos[job.Job])
 	if err != nil {
 		return nil, fmt.Errorf("store: claim: scanning rows: %w", err)
@@ -269,4 +271,46 @@ func (s *Store) MarkEventsShipped(ctx context.Context, ids []int64) error {
 		return fmt.Errorf("store: mark events shipped: %w", err)
 	}
 	return nil
+}
+
+// CountByStatusAndType returns the number of jobs in the given status,
+// grouped by type. Backs the queue-depth and in-flight metrics.
+func (s *Store) CountByStatusAndType(ctx context.Context, status string) (map[string]int64, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT type, count(*) FROM jobs WHERE status = $1 GROUP BY type
+	`, status)
+	if err != nil {
+		return nil, fmt.Errorf("store: count by status and type: %w", err)
+	}
+	defer rows.Close()
+
+	counts := make(map[string]int64)
+	for rows.Next() {
+		var jobType string
+		var n int64
+		if err := rows.Scan(&jobType, &n); err != nil {
+			return nil, fmt.Errorf("store: count by status and type: scanning row: %w", err)
+		}
+		counts[jobType] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: count by status and type: %w", err)
+	}
+	return counts, nil
+}
+
+// ShipperLag returns how far behind the shipper is: the age of the
+// oldest unshipped job_events row, or 0 if nothing is unshipped.
+func (s *Store) ShipperLag(ctx context.Context) (time.Duration, error) {
+	var occurredAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		SELECT occurred_at FROM job_events WHERE shipped_at IS NULL ORDER BY id LIMIT 1
+	`).Scan(&occurredAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("store: shipper lag: %w", err)
+	}
+	return time.Since(occurredAt), nil
 }

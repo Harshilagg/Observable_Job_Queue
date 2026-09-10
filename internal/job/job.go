@@ -14,6 +14,11 @@ type Job struct {
 	Payload     json.RawMessage
 	Attempts    int
 	MaxAttempts int
+	// TraceContext is the W3C traceparent string captured when the job
+	// was submitted (empty for jobs submitted before this existed). The
+	// worker extracts it to continue the same trace through claim,
+	// execute, and complete instead of starting a disconnected one.
+	TraceContext string
 }
 
 // Snapshot is a point-in-time view of a job's state, for status

@@ -71,7 +71,7 @@ func TestShipOnceMovesEventsFromPostgresToClickHouse(t *testing.T) {
 	st, ch, cfg := testEnv(t)
 	logger := logging.New("error")
 
-	id, err := st.Enqueue(ctx, "demo_job", []byte(`{"n":1}`))
+	id, err := st.Enqueue(ctx, "demo_job", []byte(`{"n":1}`), "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
