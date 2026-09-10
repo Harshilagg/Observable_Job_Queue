@@ -42,6 +42,7 @@ Two long-running processes, plus a CLI that talks to them:
 ./bin/jobqueue enqueue -type=sum_numbers -payload='{"numbers":[1,2,3]}'   # via gRPC Submit
 ./bin/jobqueue status -id=123                                             # via gRPC GetStatus
 ./bin/jobqueue watch -id=123                                              # via gRPC WatchStatus (streams until terminal)
+./bin/jobqueue dead-letters -limit=20                                     # inspect terminally-failed jobs (direct DB read)
 ```
 
 `serve` and `work` are independent processes with direct database
@@ -73,6 +74,30 @@ seconds away from existing could have handled. See the comment on
 `Registry.Dispatch` in `internal/handlers/registry.go` for the full
 reasoning.
 
+### Retries: exponential backoff with jitter, and dead letters
+
+A failed job's next `run_after` is computed as exponential backoff
+(doubling per attempt, capped at `MAX_RETRY_DELAY`) with **full
+jitter**: the actual delay used is a random value between 0 and that
+computed cap, not the cap itself. This isn't about spacing out any one
+job's own retries (that's what the backoff alone does) — it's about
+preventing many jobs that fail at the same moment (e.g. a downstream
+dependency has a brief outage) from all computing the *identical*
+deterministic delay and retrying in a synchronized burst that can knock
+a just-recovering dependency back over. See the doc comment on
+`calculateRetryDelay` in `internal/worker/worker.go` for the full
+reasoning, and `internal/worker/worker_test.go` for tests that verify
+the jitter is actually happening (not just bounded).
+
+Once a job exhausts `max_attempts` — whether via `Worker.Run` giving up
+or the reaper reclaiming an exhausted lease — it's moved to terminal
+`failed` and, in the same atomic statement, a copy of it (type,
+payload, attempts, error) is written to the `dead_letters` table. This
+is what makes a terminal failure inspectable via `jobqueue dead-letters`
+rather than just a status value buried in a growing history table.
+There's no redrive/requeue-from-dead-letter capability yet — inspecting
+is all this stage does.
+
 ## Configuration
 
 All via environment variables; every one has a default suitable for the
@@ -87,7 +112,8 @@ All via environment variables; every one has a default suitable for the
 | `POLL_INTERVAL`      | `500ms`                                                       | How often an idle worker checks for new jobs      |
 | `MAX_POLL_INTERVAL`  | `5s`                                                          | Cap on the poll backoff when the queue stays empty|
 | `LEASE_DURATION`     | `30s`                                                         | How long a claim is valid before the reaper can reclaim it |
-| `RETRY_BASE_DELAY`   | `2s`                                                           | Multiplied by attempt count for retry backoff     |
+| `RETRY_BASE_DELAY`   | `2s`                                                           | Base for exponential retry backoff (doubles per attempt) |
+| `MAX_RETRY_DELAY`    | `5m`                                                           | Cap on the exponential term before jitter is applied |
 | `REAP_INTERVAL`      | `10s`                                                         | How often the reaper checks for expired leases    |
 | `LOG_LEVEL`          | `info`                                                        | `debug`, `info`, `warn`, or `error`               |
 

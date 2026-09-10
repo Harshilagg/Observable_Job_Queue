@@ -7,6 +7,7 @@
 //	jobqueue enqueue -type=<t> -payload=<j>  # submit a job (via gRPC)
 //	jobqueue status -id=<id>                 # one status snapshot (via gRPC)
 //	jobqueue watch -id=<id>                  # stream status until terminal (via gRPC)
+//	jobqueue dead-letters -limit=<n>          # inspect terminally-failed jobs (direct DB read)
 package main
 
 import (
@@ -38,7 +39,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: jobqueue <serve|work|enqueue|status|watch> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: jobqueue <serve|work|enqueue|status|watch|dead-letters> [flags]")
 		os.Exit(1)
 	}
 
@@ -64,6 +65,10 @@ func main() {
 		runServe(cfg, logger)
 	case "work":
 		runWork(cfg, logger, os.Args[2:])
+	// dead-letters is a direct, read-only DB query — an operational/
+	// debugging surface, not (yet) part of the client-facing gRPC API.
+	case "dead-letters":
+		runDeadLetters(cfg, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
 		os.Exit(1)
@@ -178,6 +183,35 @@ func printStatusUpdate(u *jobqueuepb.StatusUpdate) {
 		u.GetId(), u.GetStatus(), u.GetAttempts(), u.GetMaxAttempts(), u.GetLastError())
 }
 
+// runDeadLetters prints the most recent terminally-failed jobs.
+func runDeadLetters(cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("dead-letters", flag.ExitOnError)
+	limit := fs.Int("limit", 20, "max number of dead letters to show, most recent first")
+	fs.Parse(args)
+
+	ctx := context.Background()
+	st, err := store.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "dead-letters:", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	letters, err := st.ListDeadLetters(ctx, *limit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "dead-letters failed:", err)
+		os.Exit(1)
+	}
+	if len(letters) == 0 {
+		fmt.Println("no dead letters")
+		return
+	}
+	for _, dl := range letters {
+		fmt.Printf("job %d (type=%s, attempts=%d, failed_at=%s): %s\n",
+			dl.JobID, dl.Type, dl.Attempts, dl.FailedAt.Format(time.RFC3339), dl.LastError)
+	}
+}
+
 // runServe starts the gRPC API on cfg.GRPCAddr and blocks until
 // SIGINT/SIGTERM, at which point it stops accepting new RPCs and lets
 // in-flight ones finish before exiting.
@@ -253,7 +287,7 @@ func runWork(cfg config.Config, logger *slog.Logger, args []string) {
 
 	for i := 0; i < *workerCount; i++ {
 		id := fmt.Sprintf("worker-%d", i)
-		w := worker.New(st, registry.Dispatch, id, cfg.LeaseDuration, cfg.PollInterval, cfg.MaxPollInterval, cfg.RetryBaseDelay, logger)
+		w := worker.New(st, registry.Dispatch, id, cfg.LeaseDuration, cfg.PollInterval, cfg.MaxPollInterval, cfg.RetryBaseDelay, cfg.MaxRetryDelay, logger)
 		g.Go(func() error {
 			return w.Run(gctx)
 		})
@@ -283,13 +317,13 @@ func runReaper(ctx context.Context, st *store.Store, interval time.Duration, log
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			n, err := st.ReapExpiredLeases(ctx)
+			reclaimed, deadLettered, err := st.ReapExpiredLeases(ctx)
 			if err != nil {
 				logger.Error("reap failed", "error", err)
 				continue
 			}
-			if n > 0 {
-				logger.Info("reaped expired leases", "count", n)
+			if reclaimed > 0 {
+				logger.Info("reaped expired leases", "reclaimed", reclaimed, "dead_lettered", deadLettered)
 			}
 		}
 	}

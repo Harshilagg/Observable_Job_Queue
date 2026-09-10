@@ -17,6 +17,7 @@ type Config struct {
 	MaxPollInterval time.Duration
 	LeaseDuration   time.Duration
 	RetryBaseDelay  time.Duration
+	MaxRetryDelay   time.Duration
 	ReapInterval    time.Duration
 	WorkerCount     int
 }
@@ -32,6 +33,7 @@ func Load() (Config, error) {
 		MaxPollInterval: 5 * time.Second,
 		LeaseDuration:   30 * time.Second,
 		RetryBaseDelay:  2 * time.Second,
+		MaxRetryDelay:   5 * time.Minute,
 		ReapInterval:    10 * time.Second,
 		WorkerCount:     4,
 	}
@@ -44,6 +46,7 @@ func Load() (Config, error) {
 		{"MAX_POLL_INTERVAL", &cfg.MaxPollInterval},
 		{"LEASE_DURATION", &cfg.LeaseDuration},
 		{"RETRY_BASE_DELAY", &cfg.RetryBaseDelay},
+		{"MAX_RETRY_DELAY", &cfg.MaxRetryDelay},
 		{"REAP_INTERVAL", &cfg.ReapInterval},
 	}
 	for _, d := range durations {

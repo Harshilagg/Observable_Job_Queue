@@ -5,8 +5,18 @@ GOBIN  := $(shell go env GOPATH)/bin
 
 .PHONY: build test run lint fmt migrate proto
 
+# Applies every migration in order, for a fresh database. This does
+# NOT track which migrations already ran, so re-running it against a
+# database that already has some of them applied will fail on the
+# first one that already exists (e.g. "relation already exists") — a
+# real migration tool (golang-migrate, etc.) would be the right call
+# the moment this needs to run against a partially-migrated database
+# rather than only a fresh one.
 migrate:
-	docker compose exec -T postgres psql -U jobqueue -d jobqueue < migrations/0001_create_jobs.sql
+	for f in migrations/*.sql; do \
+		echo "applying $$f"; \
+		docker compose exec -T postgres psql -U jobqueue -d jobqueue < $$f || exit 1; \
+	done
 
 # Needs protoc-gen-go and protoc-gen-go-grpc on PATH:
 #   go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12

@@ -30,6 +30,10 @@ func newTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(s.Close)
 
+	// dead_letters has a foreign key to jobs, so it must be cleared first.
+	if _, err := s.pool.Exec(ctx, "DELETE FROM dead_letters"); err != nil {
+		t.Fatalf("cleaning dead_letters table: %v", err)
+	}
 	if _, err := s.pool.Exec(ctx, "DELETE FROM jobs"); err != nil {
 		t.Fatalf("cleaning jobs table: %v", err)
 	}
@@ -174,6 +178,21 @@ func TestFailIsTerminal(t *testing.T) {
 	if lastErr != "unrecoverable" {
 		t.Errorf("last_error = %q, want unrecoverable", lastErr)
 	}
+
+	var dlAttempts int
+	var dlLastErr string
+	err = s.pool.QueryRow(ctx,
+		"SELECT attempts, last_error FROM dead_letters WHERE job_id = $1", id,
+	).Scan(&dlAttempts, &dlLastErr)
+	if err != nil {
+		t.Fatalf("expected a dead_letters row for job %d, got: %v", id, err)
+	}
+	if dlAttempts != 1 {
+		t.Errorf("dead_letters attempts = %d, want 1", dlAttempts)
+	}
+	if dlLastErr != "unrecoverable" {
+		t.Errorf("dead_letters last_error = %q, want unrecoverable", dlLastErr)
+	}
 }
 
 func TestReapExpiredLeasesRequeuesUnderAttemptCeiling(t *testing.T) {
@@ -191,12 +210,15 @@ func TestReapExpiredLeasesRequeuesUnderAttemptCeiling(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 
-	n, err := s.ReapExpiredLeases(ctx)
+	reclaimed, deadLettered, err := s.ReapExpiredLeases(ctx)
 	if err != nil {
 		t.Fatalf("ReapExpiredLeases: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("reaped %d rows, want 1", n)
+	if reclaimed != 1 {
+		t.Fatalf("reclaimed %d rows, want 1", reclaimed)
+	}
+	if deadLettered != 0 {
+		t.Errorf("dead_lettered = %d, want 0 (job is still under max_attempts)", deadLettered)
 	}
 
 	var status string
@@ -215,6 +237,14 @@ func TestReapExpiredLeasesRequeuesUnderAttemptCeiling(t *testing.T) {
 	}
 	if leaseExpiresAt != nil {
 		t.Errorf("lease_expires_at = %v, want nil (cleared)", *leaseExpiresAt)
+	}
+
+	var dlCount int
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM dead_letters WHERE job_id = $1", id).Scan(&dlCount); err != nil {
+		t.Fatalf("counting dead_letters: %v", err)
+	}
+	if dlCount != 0 {
+		t.Errorf("dead_letters rows for job %d = %d, want 0 (only requeued, not failed)", id, dlCount)
 	}
 }
 
@@ -237,8 +267,15 @@ func TestReapExpiredLeasesFailsWhenAttemptsExhausted(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 
-	if _, err := s.ReapExpiredLeases(ctx); err != nil {
+	reclaimed, deadLettered, err := s.ReapExpiredLeases(ctx)
+	if err != nil {
 		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if reclaimed != 1 {
+		t.Errorf("reclaimed = %d, want 1", reclaimed)
+	}
+	if deadLettered != 1 {
+		t.Errorf("dead_lettered = %d, want 1 (attempts=1 >= max_attempts=1)", deadLettered)
 	}
 
 	var status string
@@ -247,6 +284,54 @@ func TestReapExpiredLeasesFailsWhenAttemptsExhausted(t *testing.T) {
 	}
 	if status != "failed" {
 		t.Errorf("status = %q, want failed (attempts=1 >= max_attempts=1)", status)
+	}
+
+	var dlAttempts int
+	if err := s.pool.QueryRow(ctx, "SELECT attempts FROM dead_letters WHERE job_id = $1", id).Scan(&dlAttempts); err != nil {
+		t.Fatalf("expected a dead_letters row for job %d, got: %v", id, err)
+	}
+	if dlAttempts != 1 {
+		t.Errorf("dead_letters attempts = %d, want 1", dlAttempts)
+	}
+}
+
+func TestListDeadLettersReturnsMostRecentFirst(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	var ids []int64
+	for i := 0; i < 3; i++ {
+		id, err := s.Enqueue(ctx, "demo_job", []byte(`{}`))
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		if _, err := s.Claim(ctx, "worker-1", 30*time.Second, 1); err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		if err := s.Fail(ctx, id, fmt.Sprintf("boom-%d", i)); err != nil {
+			t.Fatalf("Fail: %v", err)
+		}
+		ids = append(ids, id)
+	}
+
+	letters, err := s.ListDeadLetters(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListDeadLetters: %v", err)
+	}
+	if len(letters) != 3 {
+		t.Fatalf("got %d dead letters, want 3", len(letters))
+	}
+	// Most recent first — the last one Fail'd (ids[2]) should be first.
+	if letters[0].JobID != ids[2] {
+		t.Errorf("letters[0].JobID = %d, want %d (most recently failed)", letters[0].JobID, ids[2])
+	}
+
+	limited, err := s.ListDeadLetters(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListDeadLetters with limit=1: %v", err)
+	}
+	if len(limited) != 1 {
+		t.Errorf("got %d dead letters with limit=1, want 1", len(limited))
 	}
 }
 

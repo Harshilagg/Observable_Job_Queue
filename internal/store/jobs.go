@@ -118,17 +118,26 @@ func (s *Store) Retry(ctx context.Context, id int64, runAfter time.Time, lastErr
 	return nil
 }
 
-// Fail moves a job to a terminal failed state — no further retries.
+// Fail moves a job to a terminal failed state — no further retries —
+// and, in the same atomic statement, writes a dead_letters record for
+// it. One statement rather than an UPDATE plus a separate INSERT for
+// the same reason the claim query is one statement: no window where
+// one side committed and the other didn't.
 func (s *Store) Fail(ctx context.Context, id int64, lastErr string) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE jobs
-		SET status = 'failed',
-		    completed_at = now(),
-		    claimed_by = NULL,
-		    claimed_at = NULL,
-		    lease_expires_at = NULL,
-		    last_error = $2
-		WHERE id = $1
+		WITH failed AS (
+		    UPDATE jobs
+		    SET status = 'failed',
+		        completed_at = now(),
+		        claimed_by = NULL,
+		        claimed_at = NULL,
+		        lease_expires_at = NULL,
+		        last_error = $2
+		    WHERE id = $1
+		    RETURNING id, type, payload, attempts
+		)
+		INSERT INTO dead_letters (job_id, type, payload, attempts, last_error)
+		SELECT id, type, payload, attempts, $2 FROM failed
 	`, id, lastErr)
 	if err != nil {
 		return fmt.Errorf("store: fail: %w", err)
@@ -141,21 +150,52 @@ func (s *Store) Fail(ctx context.Context, id int64, lastErr string) error {
 // and then crashed or was killed before finishing it. A job under its
 // max_attempts goes back to 'queued'; one that has exhausted its
 // attempts (already incremented at claim time) goes straight to
-// 'failed' instead of being handed out again. It returns how many rows
-// were reclaimed, for logging/metrics.
-func (s *Store) ReapExpiredLeases(ctx context.Context) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE jobs
-		SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
-		    completed_at = CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END,
-		    claimed_by = NULL,
-		    claimed_at = NULL,
-		    lease_expires_at = NULL,
-		    last_error = 'lease expired: worker did not report back in time'
-		WHERE status = 'running' AND lease_expires_at < now()
-	`)
+// 'failed' and gets a dead_letters record, in the same statement, same
+// as Fail. Returns (total reclaimed, of which dead-lettered).
+func (s *Store) ReapExpiredLeases(ctx context.Context) (reclaimed int64, deadLettered int64, err error) {
+	const lastErr = "lease expired: worker did not report back in time"
+	err = s.pool.QueryRow(ctx, `
+		WITH reaped AS (
+		    UPDATE jobs
+		    SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
+		        completed_at = CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END,
+		        claimed_by = NULL,
+		        claimed_at = NULL,
+		        lease_expires_at = NULL,
+		        last_error = $1
+		    WHERE status = 'running' AND lease_expires_at < now()
+		    RETURNING id, type, payload, attempts, status
+		),
+		dead_lettered AS (
+		    INSERT INTO dead_letters (job_id, type, payload, attempts, last_error)
+		    SELECT id, type, payload, attempts, $1 FROM reaped WHERE status = 'failed'
+		    RETURNING job_id
+		)
+		SELECT
+		    (SELECT count(*) FROM reaped)::bigint,
+		    (SELECT count(*) FROM dead_lettered)::bigint
+	`, lastErr).Scan(&reclaimed, &deadLettered)
 	if err != nil {
-		return 0, fmt.Errorf("store: reap expired leases: %w", err)
+		return 0, 0, fmt.Errorf("store: reap expired leases: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	return reclaimed, deadLettered, nil
+}
+
+// ListDeadLetters returns the most recent dead-lettered jobs, newest
+// first, up to limit.
+func (s *Store) ListDeadLetters(ctx context.Context, limit int) ([]job.DeadLetter, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, job_id, type, payload, attempts, last_error, failed_at
+		FROM dead_letters
+		ORDER BY failed_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list dead letters: %w", err)
+	}
+	letters, err := pgx.CollectRows(rows, pgx.RowToStructByPos[job.DeadLetter])
+	if err != nil {
+		return nil, fmt.Errorf("store: list dead letters: scanning rows: %w", err)
+	}
+	return letters, nil
 }
