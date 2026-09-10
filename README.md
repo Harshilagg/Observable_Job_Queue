@@ -167,6 +167,7 @@ that starvation — see `internal/store/jobs_test.go`'s
 ```
 make test     # needs docker compose up -d, make migrate, make ch-migrate first
 make lint     # gofmt + go vet
+make fmt      # gofmt -w .
 ```
 
 `make test` runs `go test -p 1 -count=1 ./...` deliberately, not plain
@@ -182,6 +183,17 @@ twice. Its own connection pool is explicitly sized to that concurrency
 (see `newTestStoreWithPoolSize`) — worth reading if this test is ever
 slow or flaky again, since undersizing it was a real, previously-hit
 bug, not a hypothetical.
+
+**If jobs look "stuck" in `running` while manually testing `work`,
+check host load before assuming a bug.** On a heavily loaded or
+CPU-constrained machine (this project was debugged on one reporting
+`load average` past 20 on 4 CPUs, with several unrelated Docker
+containers also running), individual claims can take many seconds
+under contention — a job that looks permanently stuck at the 15-20
+second mark can still reach `completed`/`failed` correctly by 60
+seconds. The lease/reaper mechanism and the retry/backoff path are
+what actually matter for correctness here, not how long any single
+run happens to take; don't mistake a slow host for a hang.
 
 ## Layout
 
