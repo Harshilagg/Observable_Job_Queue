@@ -5,16 +5,19 @@ the same `jobs` table concurrently; the storage layer guarantees that no
 two workers ever claim the same job, and that a worker crashing mid-job
 doesn't strand that job forever. Job submission and status are exposed
 over a gRPC API; the CLI is a thin client over that API, not a separate
-path into the store.
+path into the store. Job lifecycle events are shipped asynchronously to
+ClickHouse for analytics, without that shipping ever being able to block
+claiming or executing a job.
 
-No ClickHouse, no Kubernetes, no Prometheus yet — those are later weeks.
+No Kubernetes, no Prometheus yet — those are later weeks.
 
 ## Setup
 
 ```
-docker compose up -d      # start Postgres
-make migrate              # create the jobs table and indexes
-make build                # build ./bin/jobqueue
+docker compose up -d      # start Postgres and ClickHouse
+make migrate               # create the jobs/dead_letters/job_events tables
+make ch-migrate             # create ClickHouse's job_events table
+make build                 # build ./bin/jobqueue
 ```
 
 Regenerating the gRPC code (only needed if you change `proto/`) requires
@@ -98,6 +101,32 @@ rather than just a status value buried in a growing history table.
 There's no redrive/requeue-from-dead-letter capability yet — inspecting
 is all this stage does.
 
+### Analytics: job events shipped to ClickHouse
+
+Every state-changing `Store` method (`Enqueue`, `Claim`, `Complete`,
+`Retry`, `Fail`, `ReapExpiredLeases`) writes a row to a `job_events`
+outbox table in Postgres, atomically, in the same statement as its own
+update — the same CTE pattern `dead_letters` uses. A background
+shipper goroutine inside `work` (`internal/analytics`) polls that
+outbox on a ticker, batches unshipped rows into ClickHouse, and marks
+them shipped in Postgres.
+
+Postgres stays authoritative regardless of ClickHouse's availability:
+if ClickHouse is unreachable at `work` startup, that's logged as a
+warning, not a fatal error — events simply accumulate unshipped until
+a connection succeeds. Shipping is at-least-once, not exactly-once (a
+crash between inserting into ClickHouse and marking rows shipped
+re-sends the batch next tick), so ClickHouse's `job_events` table uses
+`ReplacingMergeTree` keyed on the Postgres outbox row's own id —
+duplicate inserts merge away in the background. A query that needs a
+guaranteed-deduped read before a merge has happened should add `FINAL`;
+aggregate queries over a real time range usually don't need to bother.
+
+This is what makes questions like "throughput over time" or "failure
+rate by job type" answerable without competing with the live claim
+query for Postgres's attention — see `clickhouse/schema.sql` and
+`internal/analytics/shipper.go` for the full design notes.
+
 ## Configuration
 
 All via environment variables; every one has a default suitable for the
@@ -106,6 +135,7 @@ All via environment variables; every one has a default suitable for the
 | Variable            | Default                                                    | Meaning                                          |
 |---------------------|-------------------------------------------------------------|---------------------------------------------------|
 | `DATABASE_URL`       | `postgres://jobqueue:jobqueue@localhost:5433/jobqueue`       | Postgres connection string (used by `serve`, `work`) |
+| `DB_MAX_CONNS`       | `20`                                                           | Pool size for `serve`/`dead-letters`; `work` instead sizes its own pool to `-workers`+4 (see below) |
 | `GRPC_ADDR`          | `localhost:50051`                                             | Address `serve` listens on, and clients dial      |
 | `WRITE_FILE_DIR`     | `./data/writes`                                               | Sandbox directory the `write_file` handler is allowed to write into |
 | `WORKER_COUNT`       | `4`                                                           | Default `-workers` for `work` if not overridden   |
@@ -115,18 +145,43 @@ All via environment variables; every one has a default suitable for the
 | `RETRY_BASE_DELAY`   | `2s`                                                           | Base for exponential retry backoff (doubles per attempt) |
 | `MAX_RETRY_DELAY`    | `5m`                                                           | Cap on the exponential term before jitter is applied |
 | `REAP_INTERVAL`      | `10s`                                                         | How often the reaper checks for expired leases    |
+| `CLICKHOUSE_ADDR`    | `localhost:9001`                                              | ClickHouse native-protocol address                |
+| `CLICKHOUSE_DATABASE`| `jobqueue`                                                    | Must be named explicitly — see `make ch-migrate`'s note |
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `jobqueue` / `jobqueue`                  | ClickHouse credentials                            |
+| `SHIP_INTERVAL`      | `5s`                                                          | How often `work`'s shipper polls for unshipped events |
+| `SHIP_BATCH_SIZE`    | `1000`                                                        | Max events shipped to ClickHouse per tick          |
 | `LOG_LEVEL`          | `info`                                                        | `debug`, `info`, `warn`, or `error`               |
+
+`work`'s own connection pool is sized to `-workers`+4, not
+`DB_MAX_CONNS` — it needs one connection per worker plus headroom for
+its always-on reaper and shipper goroutines, and that number depends
+on `-workers`, which `DB_MAX_CONNS` alone can't express. This was a
+real bug, not a hypothetical: `pgxpool`'s CPU-based default pool size
+can be smaller than a `work` process's actual concurrent demand on a
+CPU-constrained machine, and this project's own test suite hit exactly
+that starvation — see `internal/store/jobs_test.go`'s
+`newTestStoreWithPoolSize` for the full writeup.
 
 ## Development
 
 ```
-make test     # needs docker compose up -d && make migrate first
+make test     # needs docker compose up -d, make migrate, make ch-migrate first
 make lint     # gofmt + go vet
 ```
 
-`internal/store/jobs_test.go` runs against the real Postgres container
-(not a mock) — including a concurrency test that races 20 goroutines
-against 2,000 seeded jobs and asserts none is ever claimed twice.
+`make test` runs `go test -p 1 -count=1 ./...` deliberately, not plain
+`go test ./...`: `internal/store` and `internal/analytics` both mutate
+the same live, shared Postgres tables (not mocks — e.g. `SKIP LOCKED`'s
+behavior is a property of Postgres's actual lock manager), and Go runs
+different packages' tests concurrently by default, which caused real
+cross-package interference before `-p 1` was added.
+
+`internal/store/jobs_test.go` includes a concurrency test that races 20
+goroutines against 2,000 seeded jobs and asserts none is ever claimed
+twice. Its own connection pool is explicitly sized to that concurrency
+(see `newTestStoreWithPoolSize`) — worth reading if this test is ever
+slow or flaky again, since undersizing it was a real, previously-hit
+bug, not a hypothetical.
 
 ## Layout
 
@@ -137,6 +192,8 @@ internal/grpcserver/          gRPC service implementation (thin: proto <-> store
 internal/store/               all SQL; Claim/Complete/Retry/Fail/ReapExpiredLeases
 internal/worker/              claim/execute/complete loop
 internal/handlers/            job-type registry + real handler implementations
+internal/analytics/           ClickHouse client + the job_events shipper
 internal/job/                 domain types shared across the above
-cmd/jobqueue/                 serve / work / enqueue / status / watch
+clickhouse/                   ClickHouse schema (source of truth for job_events there)
+cmd/jobqueue/                 serve / work / enqueue / status / watch / dead-letters
 ```
