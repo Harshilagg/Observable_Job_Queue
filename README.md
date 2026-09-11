@@ -9,12 +9,13 @@ path into the store. Job lifecycle events are shipped asynchronously to
 ClickHouse for analytics, without that shipping ever being able to block
 claiming or executing a job.
 
-No Kubernetes, no Prometheus yet — those are later weeks.
+Metrics, traces, and a provisioned Grafana dashboard are included; a
+Kubernetes deployment is not yet.
 
 ## Setup
 
 ```
-docker compose up -d      # start Postgres and ClickHouse
+docker compose up -d      # start Postgres, ClickHouse, Prometheus, Tempo, Grafana
 make migrate               # create the jobs/dead_letters/job_events tables
 make ch-migrate             # create ClickHouse's job_events table
 make build                 # build ./bin/jobqueue
@@ -127,6 +128,57 @@ rate by job type" answerable without competing with the live claim
 query for Postgres's attention — see `clickhouse/schema.sql` and
 `internal/analytics/shipper.go` for the full design notes.
 
+### Observability: metrics, traces, and Grafana
+
+`docker compose up -d` starts Prometheus, Grafana Tempo, and Grafana
+alongside Postgres and ClickHouse — `docker compose up` alone gives a
+working dashboard, not an empty one. Open **http://localhost:3000**
+(anonymous viewer access, no login needed) and the "Observable Job
+Queue" dashboard is already there, provisioned from
+`observability/grafana/provisioning/dashboards/jobqueue.json`.
+
+`work` (not `serve` — there's nothing to poll on a process with no
+queue-depth state) exposes Prometheus metrics on `METRICS_ADDR`
+(`:9464` by default):
+
+| Metric                          | Type      | What it answers |
+|----------------------------------|-----------|------------------|
+| `jobqueue_queue_depth`           | gauge, by `job_type` | How many jobs are waiting right now |
+| `jobqueue_in_flight`             | gauge, by `job_type` | How many jobs are currently claimed/running |
+| `jobqueue_claim_duration_seconds`| histogram | How long a `Claim` call takes — the thing that gets slow under contention |
+| `jobqueue_job_duration_seconds`  | histogram, by `job_type` | How long a handler actually takes to run |
+| `jobqueue_retries_total`         | counter, by `job_type` | Retry rate |
+| `jobqueue_dead_letters_total`    | counter, by `job_type` | Dead-letter rate |
+| `jobqueue_shipper_lag_seconds`   | gauge     | Age of the oldest unshipped `job_events` row — how far ClickHouse is behind Postgres |
+
+`queue_depth`, `in_flight`, and `shipper_lag` are implemented as a
+Prometheus `Collector` (`internal/metrics/collector.go`) that queries
+Postgres fresh on every `/metrics` scrape, rather than a `Gauge` kept
+updated in memory — this state lives in the database, is shared across
+every `work` process, and can change from a claim happening in a
+*different* process, so polling the source of truth on scrape is more
+correct than any one process trying to track it itself. The other four
+are ordinary event-driven `Histogram`/`CounterVec` updates at the point
+each event happens, inside `internal/worker/worker.go`.
+
+Every job also carries a trace spanning **submit → claim → execute →
+complete**, even though those steps run in different processes
+(`serve` for submit, `work` for the rest) and are separated by however
+long the job sits queued. A trace normally propagates through request
+headers, but there's no live request connecting these steps — the job
+sits in Postgres between them, sometimes for a while. So `Enqueue`
+stores the submitting span's context as a W3C traceparent string in a
+new `trace_context` column, and `Claim` reads it back and starts the
+worker's spans as children of it (`internal/tracing/tracing.go`,
+`Inject`/`Extract`). A retried job keeps reusing the *original*
+submission's trace context, so every attempt shows up as a sibling
+span under the same trace rather than starting a disconnected one.
+Traces export via OTLP to Tempo at `OTLP_ENDPOINT` (`localhost:4317`
+by default); if the collector is unreachable, `tracing.Setup` logs a
+warning and the binary runs without tracing — same non-fatal treatment
+as ClickHouse being unreachable, for the same reason (observability
+being down must never take job processing down with it).
+
 ## Configuration
 
 All via environment variables; every one has a default suitable for the
@@ -150,6 +202,8 @@ All via environment variables; every one has a default suitable for the
 | `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `jobqueue` / `jobqueue`                  | ClickHouse credentials                            |
 | `SHIP_INTERVAL`      | `5s`                                                          | How often `work`'s shipper polls for unshipped events |
 | `SHIP_BATCH_SIZE`    | `1000`                                                        | Max events shipped to ClickHouse per tick          |
+| `OTLP_ENDPOINT`      | `localhost:4317`                                              | Where `serve`/`work` export traces (Tempo's OTLP gRPC port) |
+| `METRICS_ADDR`       | `:9464`                                                       | Where `work` serves `/metrics` for Prometheus to scrape |
 | `LOG_LEVEL`          | `info`                                                        | `debug`, `info`, `warn`, or `error`               |
 
 `work`'s own connection pool is sized to `-workers`+4, not
@@ -184,6 +238,19 @@ twice. Its own connection pool is explicitly sized to that concurrency
 slow or flaky again, since undersizing it was a real, previously-hit
 bug, not a hypothetical.
 
+This test has since flaked again on the same machine for a second,
+distinct reason, worth telling apart from the pool-sizing bug above:
+adding Prometheus/Tempo/Grafana plus an unrelated project's containers
+pushed this 4-CPU host to ~10 total containers. A run that stalled at
+"claimed 20 of 2000" was checked live against `pg_stat_activity` mid-run
+— every connection sat `idle`/`ClientRead`, meaning Postgres was
+waiting on the Go client, not the other way around. The bottleneck was
+host CPU scheduling starving the test's own goroutines, not a database
+lock. Re-running the identical test in isolation (or the full suite at
+a quieter moment) passed in ~20s with no code change. If this test
+stalls, check `docker stats`/`uptime` before suspecting the claim query
+— a saturated host can make a correct test look broken.
+
 **If jobs look "stuck" in `running` while manually testing `work`,
 check host load before assuming a bug.** On a heavily loaded or
 CPU-constrained machine (this project was debugged on one reporting
@@ -205,7 +272,10 @@ internal/store/               all SQL; Claim/Complete/Retry/Fail/ReapExpiredLeas
 internal/worker/              claim/execute/complete loop
 internal/handlers/            job-type registry + real handler implementations
 internal/analytics/           ClickHouse client + the job_events shipper
+internal/metrics/             Prometheus metrics + the DB-backed queue-depth/in-flight/shipper-lag collector
+internal/tracing/             OpenTelemetry setup + trace-context inject/extract across the Postgres handoff
 internal/job/                 domain types shared across the above
 clickhouse/                   ClickHouse schema (source of truth for job_events there)
+observability/                Prometheus, Tempo, and Grafana provisioning (datasources + the checked-in dashboard)
 cmd/jobqueue/                 serve / work / enqueue / status / watch / dead-letters
 ```
