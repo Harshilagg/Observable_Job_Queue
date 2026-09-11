@@ -15,7 +15,10 @@ import (
 	"github.com/Harshilagg/Observable_Job_Queue/internal/job"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/pb/jobqueuepb"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/store"
+	"github.com/Harshilagg/Observable_Job_Queue/internal/tracing"
 )
+
+var tracer = tracing.Tracer("grpcserver")
 
 // Server implements jobqueuepb.JobQueueServer.
 type Server struct {
@@ -27,10 +30,18 @@ func New(st *store.Store) *Server {
 	return &Server{store: st}
 }
 
-// Submit enqueues a new job and returns its id.
+// Submit enqueues a new job and returns its id. This is the root of a
+// job's trace: its span context is captured and stored on the row
+// itself (see internal/tracing's package doc), so the worker that
+// eventually claims this job can continue the same trace instead of
+// starting a disconnected one.
 func (s *Server) Submit(ctx context.Context, req *jobqueuepb.SubmitRequest) (*jobqueuepb.SubmitResponse, error) {
-	id, err := s.store.Enqueue(ctx, req.GetType(), req.GetPayload())
+	ctx, span := tracer.Start(ctx, "submit")
+	defer span.End()
+
+	id, err := s.store.Enqueue(ctx, req.GetType(), req.GetPayload(), tracing.Inject(ctx))
 	if err != nil {
+		span.RecordError(err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &jobqueuepb.SubmitResponse{Id: id}, nil

@@ -18,11 +18,14 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -33,8 +36,10 @@ import (
 	"github.com/Harshilagg/Observable_Job_Queue/internal/grpcserver"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/handlers"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/logging"
+	"github.com/Harshilagg/Observable_Job_Queue/internal/metrics"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/pb/jobqueuepb"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/store"
+	"github.com/Harshilagg/Observable_Job_Queue/internal/tracing"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/worker"
 )
 
@@ -220,6 +225,15 @@ func runServe(cfg config.Config, logger *slog.Logger) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// A Tempo outage must not stop the API from serving requests, same
+	// reasoning as ClickHouse below: this is observability, not
+	// correctness. Setup failure just means spans go to a no-op tracer.
+	if shutdownTracing, err := tracing.Setup(ctx, "jobqueue-serve", cfg.OTLPEndpoint); err != nil {
+		logger.Error("tracing setup failed, continuing without traces", "error", err)
+	} else {
+		defer shutdownTracing(context.Background())
+	}
+
 	st, err := store.New(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
 		logger.Error("failed to connect to database", "error", err)
@@ -271,6 +285,12 @@ func runWork(cfg config.Config, logger *slog.Logger, args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if shutdownTracing, err := tracing.Setup(ctx, "jobqueue-work", cfg.OTLPEndpoint); err != nil {
+		logger.Error("tracing setup failed, continuing without traces", "error", err)
+	} else {
+		defer shutdownTracing(context.Background())
+	}
+
 	// Sized to this process's own actual concurrent demand — one
 	// connection per worker, plus headroom for the reaper and shipper
 	// goroutines that share this same pool — rather than trusting
@@ -292,11 +312,32 @@ func runWork(cfg config.Config, logger *slog.Logger, args []string) {
 
 	registry := newHandlerRegistry(cfg, logger)
 
+	promReg := prometheus.NewRegistry()
+	m := metrics.New(promReg)
+	metrics.RegisterStoreCollector(promReg, st, logger)
+
+	metricsServer := &http.Server{
+		Addr:    cfg.MetricsAddr,
+		Handler: promhttp.HandlerFor(promReg, promhttp.HandlerOpts{}),
+	}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		metricsServer.Shutdown(shutdownCtx)
+	}()
+	go func() {
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics server failed", "error", err)
+		}
+	}()
+	logger.Info("metrics listening", "addr", cfg.MetricsAddr)
+
 	g, gctx := errgroup.WithContext(ctx)
 
 	for i := 0; i < *workerCount; i++ {
 		id := fmt.Sprintf("worker-%d", i)
-		w := worker.New(st, registry.Dispatch, id, cfg.LeaseDuration, cfg.PollInterval, cfg.MaxPollInterval, cfg.RetryBaseDelay, cfg.MaxRetryDelay, logger)
+		w := worker.New(st, registry.Dispatch, id, cfg.LeaseDuration, cfg.PollInterval, cfg.MaxPollInterval, cfg.RetryBaseDelay, cfg.MaxRetryDelay, m, logger)
 		g.Go(func() error {
 			return w.Run(gctx)
 		})

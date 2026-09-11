@@ -9,9 +9,17 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/Harshilagg/Observable_Job_Queue/internal/job"
+	"github.com/Harshilagg/Observable_Job_Queue/internal/metrics"
 	"github.com/Harshilagg/Observable_Job_Queue/internal/store"
+	"github.com/Harshilagg/Observable_Job_Queue/internal/tracing"
 )
+
+var tracer = tracing.Tracer("worker")
 
 // Handler executes one job. Returning an error signals failure; the
 // worker decides whether that means a retry or a terminal failure.
@@ -28,10 +36,11 @@ type Worker struct {
 	maxPollInterval time.Duration
 	retryBaseDelay  time.Duration
 	maxRetryDelay   time.Duration
+	metrics         *metrics.Metrics
 	logger          *slog.Logger
 }
 
-func New(st *store.Store, handler Handler, id string, leaseDuration, pollInterval, maxPollInterval, retryBaseDelay, maxRetryDelay time.Duration, logger *slog.Logger) *Worker {
+func New(st *store.Store, handler Handler, id string, leaseDuration, pollInterval, maxPollInterval, retryBaseDelay, maxRetryDelay time.Duration, m *metrics.Metrics, logger *slog.Logger) *Worker {
 	return &Worker{
 		store:           st,
 		handler:         handler,
@@ -41,6 +50,7 @@ func New(st *store.Store, handler Handler, id string, leaseDuration, pollInterva
 		maxPollInterval: maxPollInterval,
 		retryBaseDelay:  retryBaseDelay,
 		maxRetryDelay:   maxRetryDelay,
+		metrics:         m,
 		logger:          logger,
 	}
 }
@@ -53,7 +63,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
+		claimStart := time.Now()
 		jobs, err := w.store.Claim(ctx, w.id, w.leaseDuration, 1)
+		w.metrics.ClaimDuration.Observe(time.Since(claimStart).Seconds())
 		if err != nil {
 			w.logger.Error("claim failed", "error", err)
 		}
@@ -71,34 +83,70 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 		interval = w.pollInterval
-		// Once a job is claimed, finishing it — running the handler AND
-		// recording the outcome — must not be cut short by shutdown
-		// cancellation. Only the next loop iteration's claim/wait should
-		// see ctx cancelled.
-		jobCtx := context.WithoutCancel(ctx)
-		err = w.execute(jobCtx, jobs[0])
-		if err == nil {
-			err = w.store.Complete(jobCtx, jobs[0].ID)
-			if err != nil {
-				w.logger.Error("complete failed", "error", err)
-			}
-			continue
-		}
-
-		if jobs[0].Attempts >= jobs[0].MaxAttempts {
-			failErr := w.store.Fail(jobCtx, jobs[0].ID, err.Error())
-			if failErr != nil {
-				w.logger.Error("fail failed", "error", failErr)
-			}
-		} else {
-			delay := w.calculateRetryDelay(jobs[0])
-			runAt := time.Now().Add(delay)
-			err = w.store.Retry(jobCtx, jobs[0].ID, runAt, err.Error())
-			if err != nil {
-				w.logger.Error("retry failed", "error", err)
-			}
-		}
+		w.process(ctx, jobs[0])
 	}
+}
+
+// process runs one claimed job through execute and then records the
+// outcome (complete, retry, or fail) — all under one "claim" span
+// continuing the trace captured at Submit time, with "execute" and the
+// outcome each as their own child span. Uses context.WithoutCancel:
+// once a job is claimed, finishing it — running the handler AND
+// recording the outcome — must not be cut short by shutdown
+// cancellation. Only the next loop iteration's claim/wait in Run
+// should see ctx cancelled.
+func (w *Worker) process(ctx context.Context, j job.Job) {
+	jobCtx := tracing.Extract(context.WithoutCancel(ctx), j.TraceContext)
+	jobCtx, claimSpan := tracer.Start(jobCtx, "claim", trace.WithAttributes(
+		attribute.Int64("job.id", j.ID),
+		attribute.String("job.type", j.Type),
+		attribute.Int("job.attempts", j.Attempts),
+	))
+	defer claimSpan.End()
+
+	execCtx, execSpan := tracer.Start(jobCtx, "execute")
+	execStart := time.Now()
+	err := w.execute(execCtx, j)
+	w.metrics.JobDuration.WithLabelValues(j.Type).Observe(time.Since(execStart).Seconds())
+	if err != nil {
+		execSpan.RecordError(err)
+		execSpan.SetStatus(codes.Error, err.Error())
+	}
+	execSpan.End()
+
+	if err == nil {
+		_, completeSpan := tracer.Start(jobCtx, "complete")
+		if completeErr := w.store.Complete(jobCtx, j.ID); completeErr != nil {
+			completeSpan.RecordError(completeErr)
+			completeSpan.SetStatus(codes.Error, completeErr.Error())
+			w.logger.Error("complete failed", "error", completeErr)
+		}
+		completeSpan.End()
+		return
+	}
+
+	if j.Attempts >= j.MaxAttempts {
+		w.metrics.DeadLetters.WithLabelValues(j.Type).Inc()
+		_, failSpan := tracer.Start(jobCtx, "fail")
+		if failErr := w.store.Fail(jobCtx, j.ID, err.Error()); failErr != nil {
+			failSpan.RecordError(failErr)
+			failSpan.SetStatus(codes.Error, failErr.Error())
+			w.logger.Error("fail failed", "error", failErr)
+		}
+		failSpan.End()
+		return
+	}
+
+	w.metrics.Retries.WithLabelValues(j.Type).Inc()
+	_, retrySpan := tracer.Start(jobCtx, "retry")
+	delay := w.calculateRetryDelay(j)
+	runAt := time.Now().Add(delay)
+	if retryErr := w.store.Retry(jobCtx, j.ID, runAt, err.Error()); retryErr != nil {
+		retrySpan.RecordError(retryErr)
+		retrySpan.SetStatus(codes.Error, retryErr.Error())
+		w.logger.Error("retry failed", "error", retryErr)
+	}
+	retrySpan.End()
 }
 
 // execute runs the handler for a single job, converting a panic into an
