@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jobqueue-serve
+  namespace: jobqueue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jobqueue-serve
+  template:
+    metadata:
+      labels:
+        app: jobqueue-serve
+    spec:
+      containers:
+        - name: serve
+          image: jobqueue:local
+          imagePullPolicy: IfNotPresent
+          args: ["serve"]
+          ports:
+            - name: grpc
+              containerPort: 50051
+          envFrom:
+            - configMapRef:
+                name: jobqueue-config
+            - secretRef:
+                name: postgres-credentials
+          # No grpc.health.v1 service is implemented (out of scope for
+          # this pass — see README's Kubernetes section), so a TCP
+          # check on the gRPC port is the honest, lightweight signal
+          # available: it can't tell "serving" from "listening but
+          # wedged," but it does catch the common failure modes (crash,
+          # not-yet-started, panic loop).
+          # timeoutSeconds/failureThreshold raised well above defaults
+          # for the same reason as postgres.yaml's probes: a tight
+          # timeout on a contended host restarts a healthy process
+          # instead of catching a real problem sooner.
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jobqueue-serve
+  namespace: jobqueue
+spec:
+  selector:
+    app: jobqueue-serve
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc

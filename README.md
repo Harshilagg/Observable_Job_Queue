@@ -233,6 +233,70 @@ CPU-constrained machine, and this project's own test suite hit exactly
 that starvation — see `internal/store/jobs_test.go`'s
 `newTestStoreWithPoolSize` for the full writeup.
 
+## Kubernetes
+
+Manifests for Postgres, ClickHouse, a one-shot migration Job, the gRPC
+`serve` Deployment, and the `worker` Deployment live under `k8s/`,
+composed via a `kustomization.yaml` at the repo root (Kustomize
+sandboxes file references to at-or-below its own root, which is why
+the kustomization isn't inside `k8s/` itself — it needs to reach
+`migrations/*.sql` and `clickhouse/schema.sql` to generate the
+migration Job's ConfigMaps from the same files `make migrate`/
+`make ch-migrate` use locally, rather than duplicating that SQL into
+the manifests). No Prometheus/Tempo/Grafana here — this pass is scoped
+to what the prompt asked for (worker, Postgres, ClickHouse), not the
+whole observability stack.
+
+```
+docker build -t jobqueue:local .     # image both serve and worker Deployments use
+kubectl apply -k .                    # namespace, secrets, config, both databases, migrate Job, serve, worker
+kubectl get pods -n jobqueue -w       # watch it come up
+kubectl port-forward -n jobqueue svc/jobqueue-serve 50051:50051 &
+GRPC_ADDR=localhost:50051 ./bin/jobqueue enqueue -type=sum_numbers -payload='{"numbers":[1,2,3]}'
+```
+
+Any local Kubernetes works — this was built and tested against both
+`kind` and Docker Desktop's built-in Kubernetes. `kind` needed several
+attempts on the machine this was built on (a 4-CPU/4GB-RAM Docker
+Desktop VM shared with an unrelated project's containers): each
+`kindest/node` is itself a nested Docker-in-Docker VM running its own
+systemd and kubeadm, and under real host contention `kubeadm init`'s
+control-plane bootstrap has its own fixed ~60s timeout that a
+sufficiently starved host can blow through even while individual API
+requests are still succeeding. Docker Desktop's built-in Kubernetes
+came up reliably in comparison, because it shares the host's existing
+VM rather than nesting a second one inside it — worth knowing if `kind`
+ever seems to be hanging or timing out on a similarly constrained
+machine: it may not be `kind` at fault so much as the host.
+
+**A real gotcha this deployment surfaced, worth its own callout:**
+Kubernetes' exec/httpGet/tcpSocket probes default `timeoutSeconds` to
+**1**. On a contended host, `pg_isready` (or any probe command) can
+legitimately take longer than that to schedule and respond even though
+the thing being checked is perfectly healthy — and a liveness probe
+that times out gets its container killed and restarted, which is
+strictly worse than the transient slowness it was reacting to: a
+healthy Postgres gets bounced, loses its warm state, and briefly stops
+serving anything at all. This was caught live on this exact cluster —
+`postgres-0` was crash-looping purely from `pg_isready` timing out at
+1s under load, not from any real database problem. Every probe in
+`k8s/*.yaml` now sets `timeoutSeconds: 5` and `failureThreshold: 6`
+explicitly, with a comment pointing back here. The same class of lesson
+as this repo's own concurrency-test patience (see Development, below)
+and the `pgxpool` sizing note above: a tight default that assumes a
+quiet host doesn't catch problems sooner on a busy one, it just
+manufactures new ones.
+
+Secrets (`k8s/secrets.yaml`) hold the same throwaway `jobqueue`/
+`jobqueue` credentials already committed in `docker-compose.yml` — fine
+for a cluster that never leaves this laptop, not a pattern to copy for
+anything real. `write_file`'s output directory is an `emptyDir` per
+worker replica rather than a shared PVC, since it's a demo artifact,
+not state the system depends on. `jobqueue-serve` has no
+`grpc.health.v1` service implemented, so its probes are a plain TCP
+check on the gRPC port — an honest, if coarse, signal ("is anything
+listening") rather than a full "am I actually healthy" check.
+
 ## Development
 
 ```
@@ -295,4 +359,7 @@ internal/job/                 domain types shared across the above
 clickhouse/                   ClickHouse schema (source of truth for job_events there)
 observability/                Prometheus, Tempo, and Grafana provisioning (datasources + the checked-in dashboard)
 cmd/jobqueue/                 serve / work / enqueue / status / watch / dead-letters
+k8s/                           Postgres, ClickHouse, migrate Job, serve/worker Deployments
+kustomization.yaml             kubectl apply -k . — composes k8s/ with migrations/ and clickhouse/ directly
+Dockerfile                     builds jobqueue:local, the image k8s/ deploys
 ```

@@ -1,0 +1,29 @@
+# Non-secret runtime config — internal/config.Config's env vars, minus
+# the credential-bearing ones that live in Secrets instead. Values
+# match docker-compose's defaults where there's no reason to differ;
+# OTLP_ENDPOINT is left at its built-in default (no collector runs in
+# this cluster) — tracing.Setup fails non-fatally, so this is a
+# harmless no-op, not an error, matching ClickHouse's own
+# unreachable-at-startup handling.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jobqueue-config
+  namespace: jobqueue
+data:
+  GRPC_ADDR: "0.0.0.0:50051"
+  WRITE_FILE_DIR: "/data/writes"
+  WORKER_COUNT: "4"
+  DB_MAX_CONNS: "20"
+  POLL_INTERVAL: "500ms"
+  MAX_POLL_INTERVAL: "5s"
+  LEASE_DURATION: "30s"
+  RETRY_BASE_DELAY: "2s"
+  MAX_RETRY_DELAY: "5m"
+  REAP_INTERVAL: "10s"
+  CLICKHOUSE_ADDR: "clickhouse:9000"
+  CLICKHOUSE_DATABASE: "jobqueue"
+  SHIP_INTERVAL: "5s"
+  SHIP_BATCH_SIZE: "1000"
+  METRICS_ADDR: ":9464"
+  LOG_LEVEL: "info"

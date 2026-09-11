@@ -1,0 +1,70 @@
+# Runs once per apply to bring both schemas up to date. Not tracked
+# ("did this migration already run") any more than `make migrate` is —
+# see that target's own doc comment in the Makefile — so re-running
+# this Job against an already-migrated cluster fails on the first
+# already-applied statement. Fine for this demo; a real deployment
+# would use a tracked migration tool the moment it needs to run
+# against a partially-migrated database more than once.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: jobqueue
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        # postgres:18's image ships psql, so it doubles as the
+        # migration-runner image here rather than pulling in a second
+        # one just for a client binary.
+        - name: migrate-postgres
+          image: postgres:18
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              until pg_isready -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do
+                echo "waiting for postgres..."
+                sleep 2
+              done
+              for f in /migrations/*.sql; do
+                echo "applying $f"
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+              done
+          volumeMounts:
+            - name: migrations
+              mountPath: /migrations
+      containers:
+        - name: migrate-clickhouse
+          image: curlimages/curl:8.17.0
+          envFrom:
+            - secretRef:
+                name: clickhouse-credentials
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              until curl -sf "http://clickhouse:8123/ping"; do
+                echo "waiting for clickhouse..."
+                sleep 2
+              done
+              curl -sf --user "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" \
+                "http://clickhouse:8123/?database=$CLICKHOUSE_DB" \
+                --data-binary @/clickhouse-schema/schema.sql
+          volumeMounts:
+            - name: clickhouse-schema
+              mountPath: /clickhouse-schema
+      volumes:
+        - name: migrations
+          configMap:
+            name: postgres-migrations
+        - name: clickhouse-schema
+          configMap:
+            name: clickhouse-schema

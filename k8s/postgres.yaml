@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: jobqueue
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          # PG18's official image expects a single mount at
+          # /var/lib/postgresql, not .../data — a real bug this
+          # project already hit once in docker-compose.yml (see
+          # README's pgxpool/PG18 notes); reusing the wrong path here
+          # would silently re-break it.
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+          # timeoutSeconds/failureThreshold are well above the 1s/3
+          # defaults deliberately: on a contended host (this cluster
+          # has run on a shared 4-CPU/4GB machine with load averages
+          # in the hundreds during this project's own testing),
+          # pg_isready can legitimately take longer than 1s to
+          # schedule and respond even though Postgres itself is fine —
+          # a tight timeout here doesn't catch a real problem sooner,
+          # it just restarts a healthy database and makes things
+          # worse. Same lesson as this repo's own concurrency test
+          # patience (see README's Development section).
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "jobqueue", "-d", "jobqueue"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "jobqueue", "-d", "jobqueue"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: jobqueue
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

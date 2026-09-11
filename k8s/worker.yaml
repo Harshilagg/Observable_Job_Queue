@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jobqueue-worker
+  namespace: jobqueue
+spec:
+  # 3, not 1: the pod-kill demo (README's Kubernetes section) needs
+  # more than one worker pod for "kill one mid-job" to demonstrate the
+  # lease/reaper recovery path rather than just "the queue stops."
+  replicas: 3
+  selector:
+    matchLabels:
+      app: jobqueue-worker
+  template:
+    metadata:
+      labels:
+        app: jobqueue-worker
+    spec:
+      containers:
+        - name: worker
+          image: jobqueue:local
+          imagePullPolicy: IfNotPresent
+          args: ["work", "-workers=4"]
+          ports:
+            - name: metrics
+              containerPort: 9464
+          envFrom:
+            - configMapRef:
+                name: jobqueue-config
+            - secretRef:
+                name: postgres-credentials
+            - secretRef:
+                name: clickhouse-credentials
+          volumeMounts:
+            - name: write-file-dir
+              mountPath: /data/writes
+          # /metrics is a genuinely meaningful signal here, not just a
+          # TCP check: work only starts serving it once the process,
+          # its Postgres pool, and its worker goroutines are up (see
+          # cmd/jobqueue/main.go's runWork) — so "not serving" reliably
+          # means "not ready to claim jobs," which is exactly what
+          # readiness is supposed to gate.
+          # timeoutSeconds/failureThreshold raised well above defaults
+          # for the same reason as postgres.yaml's probes: a tight
+          # timeout on a contended host restarts a healthy process
+          # instead of catching a real problem sooner.
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+      volumes:
+        # emptyDir, not a PVC: write_file's output is a demo artifact,
+        # not state the system depends on, and giving each replica its
+        # own ephemeral volume avoids needing ReadWriteMany storage
+        # just for this.
+        - name: write-file-dir
+          emptyDir: {}

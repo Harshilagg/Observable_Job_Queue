@@ -1,0 +1,35 @@
+# kubectl apply -k .
+#
+# Lives at the repo root, not inside k8s/, so configMapGenerator can
+# read the SQL straight from migrations/ and clickhouse/ — the same
+# files `make migrate`/`make ch-migrate` apply locally — without
+# duplicating their contents into a separate ConfigMap manifest that
+# could drift out of sync with the real schema. (Kustomize sandboxes
+# file references to at-or-below its own root, so this couldn't reach
+# ../migrations from a kustomization placed inside k8s/.) The generated
+# ConfigMap names get a content-hash suffix, which kustomize also
+# rewrites every reference to automatically — see migrate-job.yaml,
+# which just names them "postgres-migrations"/"clickhouse-schema" and
+# never sees the real, hashed name.
+namespace: jobqueue
+
+resources:
+  - k8s/namespace.yaml
+  - k8s/secrets.yaml
+  - k8s/configmap.yaml
+  - k8s/postgres.yaml
+  - k8s/clickhouse.yaml
+  - k8s/migrate-job.yaml
+  - k8s/serve.yaml
+  - k8s/worker.yaml
+
+configMapGenerator:
+  - name: postgres-migrations
+    files:
+      - migrations/0001_create_jobs.sql
+      - migrations/0002_add_dead_letters.sql
+      - migrations/0003_add_job_events_outbox.sql
+      - migrations/0004_add_trace_context.sql
+  - name: clickhouse-schema
+    files:
+      - clickhouse/schema.sql
