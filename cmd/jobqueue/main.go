@@ -8,6 +8,8 @@
 //	jobqueue status -id=<id>                 # one status snapshot (via gRPC)
 //	jobqueue watch -id=<id>                  # stream status until terminal (via gRPC)
 //	jobqueue dead-letters -limit=<n>          # inspect terminally-failed jobs (direct DB read)
+//	jobqueue analytics -report=<r> [-window=1h] [-bucket=1m]
+//	                                          # ClickHouse-backed reports: arrivals, duration, backlog, drain-time
 package main
 
 import (
@@ -45,7 +47,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: jobqueue <serve|work|enqueue|status|watch|dead-letters> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: jobqueue <serve|work|enqueue|status|watch|dead-letters|analytics> [flags]")
 		os.Exit(1)
 	}
 
@@ -75,6 +77,11 @@ func main() {
 	// debugging surface, not (yet) part of the client-facing gRPC API.
 	case "dead-letters":
 		runDeadLetters(cfg, os.Args[2:])
+	// analytics queries ClickHouse (and, for drain-time, Postgres too)
+	// directly — see internal/analytics/reports.go for why each report
+	// needs ClickHouse rather than Postgres's jobs table.
+	case "analytics":
+		runAnalytics(cfg, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
 		os.Exit(1)
@@ -215,6 +222,97 @@ func runDeadLetters(cfg config.Config, args []string) {
 	for _, dl := range letters {
 		fmt.Printf("job %d (type=%s, attempts=%d, failed_at=%s): %s\n",
 			dl.JobID, dl.Type, dl.Attempts, dl.FailedAt.Format(time.RFC3339), dl.LastError)
+	}
+}
+
+// runAnalytics prints one of the ClickHouse-backed reports from
+// internal/analytics/reports.go, which documents why each is a
+// ClickHouse query rather than a Postgres one.
+func runAnalytics(cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("analytics", flag.ExitOnError)
+	report := fs.String("report", "", "one of: arrivals, duration, backlog, drain-time (required)")
+	window := fs.Duration("window", time.Hour, "how far back to look")
+	bucket := fs.Duration("bucket", time.Minute, "bucket size for the arrivals and backlog reports")
+	fs.Parse(args)
+
+	ctx := context.Background()
+	ch, err := analytics.NewClient(ctx, cfg.ClickHouseAddr, cfg.ClickHouseDatabase, cfg.ClickHouseUser, cfg.ClickHousePassword)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "analytics: connecting to clickhouse:", err)
+		os.Exit(1)
+	}
+	defer ch.Close()
+
+	switch *report {
+	case "arrivals":
+		rows, err := ch.ArrivalsVsCompletions(ctx, *window, *bucket)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "analytics:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%-25s %10s %12s\n", "bucket", "arrivals", "completions")
+		for _, r := range rows {
+			fmt.Printf("%-25s %10d %12d\n", r.Bucket.Format(time.RFC3339), r.Arrivals, r.Completions)
+		}
+
+	case "duration":
+		rows, err := ch.DurationPercentiles(ctx, *window)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "analytics:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%-20s %12s %10s\n", "job_type", "p99_seconds", "samples")
+		for _, r := range rows {
+			fmt.Printf("%-20s %12.3f %10d\n", r.JobType, r.P99Seconds, r.Samples)
+		}
+
+	case "backlog":
+		rows, err := ch.BacklogVsWorkers(ctx, *window, *bucket)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "analytics:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%-25s %14s %18s\n", "bucket", "active_workers", "cumulative_backlog")
+		for _, r := range rows {
+			fmt.Printf("%-25s %14d %18d\n", r.Bucket.Format(time.RFC3339), r.ActiveWorkers, r.CumulativeBacklog)
+		}
+
+	case "drain-time":
+		st, err := store.New(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "analytics: connecting to postgres:", err)
+			os.Exit(1)
+		}
+		defer st.Close()
+
+		backlog, err := st.CountByStatusAndType(ctx, "queued")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "analytics:", err)
+			os.Exit(1)
+		}
+		rates, err := ch.RecentCompletionRates(ctx, *window)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "analytics:", err)
+			os.Exit(1)
+		}
+		completionsPerSec := make(map[string]float64, len(rates))
+		for _, r := range rates {
+			completionsPerSec[r.JobType] = float64(r.Completions) / window.Seconds()
+		}
+
+		estimates := analytics.EstimateDrainTime(backlog, completionsPerSec)
+		fmt.Printf("%-20s %10s %14s %16s\n", "job_type", "backlog", "rate_per_sec", "eta")
+		for _, e := range estimates {
+			eta := "unknown (no recent completions)"
+			if e.CanEstimate {
+				eta = time.Duration(e.EstimatedSeconds * float64(time.Second)).Round(time.Second).String()
+			}
+			fmt.Printf("%-20s %10d %14.4f %16s\n", e.JobType, e.Backlog, e.CompletionsPerSec, eta)
+		}
+
+	default:
+		fmt.Fprintln(os.Stderr, "analytics: -report must be one of: arrivals, duration, backlog, drain-time")
+		os.Exit(1)
 	}
 }
 

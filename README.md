@@ -47,6 +47,7 @@ Two long-running processes, plus a CLI that talks to them:
 ./bin/jobqueue status -id=123                                             # via gRPC GetStatus
 ./bin/jobqueue watch -id=123                                              # via gRPC WatchStatus (streams until terminal)
 ./bin/jobqueue dead-letters -limit=20                                     # inspect terminally-failed jobs (direct DB read)
+./bin/jobqueue analytics -report=drain-time -window=5m                    # ClickHouse-backed reports — see Analytical queries below
 ```
 
 `serve` and `work` are independent processes with direct database
@@ -127,6 +128,22 @@ This is what makes questions like "throughput over time" or "failure
 rate by job type" answerable without competing with the live claim
 query for Postgres's attention — see `clickhouse/schema.sql` and
 `internal/analytics/shipper.go` for the full design notes.
+
+### Analytical queries: why ClickHouse, not Postgres
+
+```
+jobqueue analytics -report=arrivals   -window=1h  -bucket=1m   # arrivals vs. completions per bucket
+jobqueue analytics -report=duration   -window=1h                # p99 job duration by job type
+jobqueue analytics -report=backlog    -window=1h  -bucket=1m   # backlog trend vs. active worker count
+jobqueue analytics -report=drain-time -window=5m                # ETA to drain the current backlog, by job type
+```
+
+All four read from ClickHouse (`internal/analytics/reports.go`); `-report=drain-time` also reads Postgres directly, for a reason spelled out below. The short version of why these are ClickHouse queries at all: **Postgres's `jobs` table only ever holds each job's current row**, overwritten in place on every claim, retry, or completion. It cannot answer "how many jobs arrived per minute over the last hour" or "what was p99 duration during last Tuesday's incident" — that history is gone the moment a job's status moves on. Only the immutable, append-only `job_events` log — shipped to ClickHouse precisely so it never competes with the live claim path — has enough history to answer these:
+
+- **Arrivals vs. completions** buckets `job_events` by time and counts `enqueued` against jobs reaching a terminal state. Postgres has no historical count of what happened in past buckets, only the current queue depth *right now* (which is what the Grafana `queue_depth` panel already shows, pulled straight from Postgres). This report answers the different question of whether backlog is growing because arrivals are spiking or because completions are falling behind — over time, not right now.
+- **p99 duration by job type** pairs each attempt's `claimed` and terminal event (matched by `job_id, attempts`, since a retried job's next attempt gets a new pair) and runs `quantile(0.99)` over the difference, grouped by type. This is deliberately a *second*, complementary way to see duration alongside the Grafana `jobqueue_job_duration_seconds` histogram (`internal/metrics`): the Prometheus histogram is a live, in-process instrument that resets on every `work` restart and only reflects recent buckets. This ClickHouse query can recompute p99 for *any* past window, long after the fact, because `job_events` is durable, queryable history rather than a live counter.
+- **Backlog vs. worker count** tracks, per bucket, how many distinct `worker_id`s claimed a job alongside the running net change in backlog (arrivals minus departures) — so scaling workers up or down can be visually correlated with backlog actually draining. Postgres's `jobs.claimed_by` is overwritten on every reclaim, so the past is gone the instant a job is retried; only the event log remembers who was working when.
+- **Drain-time estimation** is the one report that deliberately reads *both* stores, because neither can answer it alone: Postgres gives the live, exact backlog count (`Store.CountByStatusAndType`, the same query the Grafana `queue_depth` panel uses), and ClickHouse gives the recent completion *rate* — a derived quantity from historical throughput that Postgres has no record of, since a job that already left the queue leaves no trace in `jobs`. `internal/analytics.EstimateDrainTime` is a pure function over the two already-fetched values (backlog ÷ rate), kept separate from the queries themselves so it's unit-testable without either database. One caveat worth knowing: the completion rate is only as fresh as the shipper, so a very short window (a few seconds) right after a burst can under-count until the next shipper tick lands — the same lag the `shipper_lag` panel already tracks. Windows of a minute or more make this negligible.
 
 ### Observability: metrics, traces, and Grafana
 
@@ -271,7 +288,7 @@ internal/grpcserver/          gRPC service implementation (thin: proto <-> store
 internal/store/               all SQL; Claim/Complete/Retry/Fail/ReapExpiredLeases
 internal/worker/              claim/execute/complete loop
 internal/handlers/            job-type registry + real handler implementations
-internal/analytics/           ClickHouse client + the job_events shipper
+internal/analytics/           ClickHouse client, the job_events shipper, and the analytical report queries
 internal/metrics/             Prometheus metrics + the DB-backed queue-depth/in-flight/shipper-lag collector
 internal/tracing/             OpenTelemetry setup + trace-context inject/extract across the Postgres handoff
 internal/job/                 domain types shared across the above
