@@ -1,16 +1,66 @@
 # Observable Job Queue
 
-A durable, Postgres-backed job queue in Go. Multiple worker processes poll
-the same `jobs` table concurrently; the storage layer guarantees that no
-two workers ever claim the same job, and that a worker crashing mid-job
-doesn't strand that job forever. Job submission and status are exposed
-over a gRPC API; the CLI is a thin client over that API, not a separate
-path into the store. Job lifecycle events are shipped asynchronously to
-ClickHouse for analytics, without that shipping ever being able to block
-claiming or executing a job.
+A durable, Postgres-backed job queue in Go, built end to end: storage
+and concurrency control, a gRPC API, retries with backoff and dead
+letters, an analytics pipeline into ClickHouse, full observability
+(metrics, traces, dashboards), and a Kubernetes deployment — with every
+non-obvious decision along the way written down as it was made, not
+reconstructed afterward.
 
-Metrics, traces, and a provisioned Grafana dashboard are included; a
-Kubernetes deployment is not yet.
+**The problem:** a job queue's correctness is almost entirely about
+what happens at the edges — two workers racing for the same row, a
+worker dying mid-job, a downstream dependency failing in a burst, a
+second datastore going down without taking the first one with it. This
+project is an exercise in taking each of those edges seriously: prove
+the concurrency guarantee with a real test under real contention, make
+failure recovery automatic rather than manual, and make the system
+observable enough that "is it healthy" and "why is it slow" are
+answered by a dashboard, not a guess.
+
+**Stack:** Go · PostgreSQL (`SKIP LOCKED`, CTE-based atomic state
+transitions) · gRPC/Protocol Buffers · ClickHouse · Prometheus ·
+OpenTelemetry · Grafana · Kubernetes · Docker.
+
+## Highlights
+
+A few of the decisions worth reading the full sections below for:
+
+- **Provably safe concurrent claims.** `Claim` uses `SELECT ... FOR
+  UPDATE SKIP LOCKED` so concurrent workers never block each other on
+  the same rows or double-claim a job — verified by a test that races
+  20 goroutines against 2,000 seeded jobs and asserts zero double
+  claims, not just reasoned about. See [Usage](#usage) and
+  [Development](#development).
+- **Two real bugs found by that same discipline, not by inspection.**
+  `pgxpool`'s CPU-based default pool size was smaller than a
+  `work` process's actual concurrent demand, silently starving
+  connections under load — found by reproducing it, not suspecting it.
+  The same class of bug resurfaced in Kubernetes: a 1-second probe
+  timeout was crash-looping a perfectly healthy Postgres under host
+  contention. Both are written up where they were found: see
+  [Configuration](#configuration) and [Kubernetes](#kubernetes).
+- **An outbox pattern that can't slow down the hot path.** Every state
+  change writes its own history atomically alongside the update, and a
+  background shipper — which can fail, lag, or restart independently —
+  moves that history into ClickHouse. See
+  [Analytics](#analytics-job-events-shipped-to-clickhouse).
+- **Distributed tracing across a queue, not a request.** A trace spans
+  submit → claim → execute → complete even though those steps run in
+  different processes, separated by however long a job sits queued —
+  by carrying the W3C trace context through a database column instead
+  of a header, since there's no live request connecting them. See
+  [Observability](#observability-metrics-traces-and-grafana).
+- **A defensible two-store split.** Four ClickHouse-backed analytical
+  reports, each with a written justification for why Postgres's
+  transactional `jobs` table structurally cannot answer the same
+  question. See
+  [Analytical queries](#analytical-queries-why-clickhouse-not-postgres).
+- **Real infrastructure, not a toy deployment.** Kubernetes manifests
+  for both databases and the app, with resource limits and health
+  probes, verified live: jobs submitted and completed through a
+  port-forwarded service, then a worker pod force-killed mid-batch to
+  confirm the deployment self-heals with zero job loss. See
+  [Kubernetes](#kubernetes).
 
 ## Setup
 
@@ -20,6 +70,10 @@ make migrate               # create the jobs/dead_letters/job_events tables
 make ch-migrate             # create ClickHouse's job_events table
 make build                 # build ./bin/jobqueue
 ```
+
+Prefer Kubernetes instead of Docker Compose? See
+[Kubernetes](#kubernetes) below — the whole stack (minus the
+observability containers) also runs as a `kubectl apply -k .` away.
 
 Regenerating the gRPC code (only needed if you change `proto/`) requires
 protoc plus two plugins:
